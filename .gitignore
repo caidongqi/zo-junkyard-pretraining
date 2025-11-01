@@ -1,0 +1,4 @@
+parallel*
+csv_logs*
+job_logs*
+cache/dataset_bs128_samples20000.pkl
