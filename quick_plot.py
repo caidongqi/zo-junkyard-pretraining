@@ -14,7 +14,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 def load_and_plot():
     """加载并绘制所有CSV数据"""
-    csv_files = glob.glob("csv_logs_ZO_full_2_1_1e-3_mudamw_10_10/*.csv")
+    csv_files = glob.glob("csv_logs_ZO_full_2_1_1e-6_sgd_10_10/*.csv")
     
     if not csv_files:
         print("❌ 在 csv_logs 目录中没有找到CSV文件")

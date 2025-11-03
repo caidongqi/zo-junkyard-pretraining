@@ -16,6 +16,10 @@ from datasets import load_dataset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+# --- 常量配置 (Constants) ---
+
+INSTRUCT_COSINE_TARGET = 0.9
+
 # --- 1. 配置与模型定义 (Configuration and Model Definition) ---
 
 def create_model(vocab_size):
@@ -121,7 +125,8 @@ def get_dataloader(tokenizer, batch_size=4, block_size=128, cache_dir="cache"):
 # --- 3. 核心算法：ZO 梯度估计 (Core Algorithm: ZO Gradient Estimator) ---
 
 @torch.no_grad()
-def zo_gradient_estimator(model, trainable_params, loss_fn, inputs, labels, q, epsilon, device):
+def zo_gradient_estimator(model, trainable_params, loss_fn, inputs, labels, q, epsilon, device, manual_directions=None):
+    """ZO梯度估计器，支持可迭代的手动方向序列。"""
     # 关闭dropout，加速且去噪
     was_training = model.training
     model.eval()
@@ -133,54 +138,168 @@ def zo_gradient_estimator(model, trainable_params, loss_fn, inputs, labels, q, e
         logits = model(inputs).logits
         return loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
 
-    # 累加“投影标量 g_i”与其对应的方向种子，节省显存
+    grads = [torch.zeros_like(p.data) for p in trainable_params]
+    used_directions = 0
+    manual_used = 0
+
+    manual_iter = None
+    if manual_directions is not None:
+        manual_iter = iter(manual_directions)
+
+    if manual_iter is not None:
+        while True:
+            if q is not None and manual_used >= q:
+                break
+            try:
+                raw_direction = next(manual_iter)
+            except StopIteration:
+                break
+            if raw_direction is None:
+                continue
+
+            direction = []
+            for p, d in zip(trainable_params, raw_direction):
+                dt = d.detach()
+                if dt.device != device or dt.dtype != p.data.dtype:
+                    dt = dt.to(device=device, dtype=p.data.dtype)
+                direction.append(dt)
+
+            for p, p0, d in zip(trainable_params, original, direction):
+                p.data = p0 + epsilon * d
+            loss_pos = f_loss()
+
+            for p, p0, d in zip(trainable_params, original, direction):
+                p.data = p0 - epsilon * d
+            loss_neg = f_loss()
+
+            for p, p0 in zip(trainable_params, original):
+                p.data = p0.clone()
+
+            proj = (loss_pos - loss_neg) / (2 * epsilon)
+            for gi, d in enumerate(direction):
+                grads[gi].add_(proj * d)
+
+            used_directions += 1
+            manual_used += 1
+
+    remaining_q = 0
+    if q is not None:
+        remaining_q = max(q - manual_used, 0)
+
+    # 随机方向部分，继续使用种子以节省显存
     seeds = []
     proj_grads = []
-
-    for _ in range(q):
-        seed = torch.randint(0, 2**31-1, ()).item()
+    for _ in range(remaining_q):
+        seed = torch.randint(0, 2**31 - 1, ()).item()
         seeds.append(seed)
 
-        # +εz
         torch.manual_seed(seed)
         for p in trainable_params:
             z = torch.randn_like(p.data)
             p.data = p.data + epsilon * z
         loss_pos = f_loss()
 
-        # -εz（从 +εz 直接到 -εz = 原值 - εz，因此需要再减 2εz）
         torch.manual_seed(seed)
         for p, p0 in zip(trainable_params, original):
             z = torch.randn_like(p.data)
-            p.data = p.data - 2 * epsilon * z
+            p.data = p0 - epsilon * z
         loss_neg = f_loss()
 
-        # 恢复到原值
         for p, p0 in zip(trainable_params, original):
             p.data = p0.clone()
 
         proj_grads.append(((loss_pos - loss_neg) / (2 * epsilon)).item())
 
-    # 用投影标量与同一随机种子重建 z 并得到“参数形状的梯度”
-    grads = [torch.zeros_like(p.data) for p in trainable_params]
-    denom = float(len(proj_grads))
-
-    for seed, g in zip(seeds, proj_grads):
+    # 重建随机方向贡献
+    for seed, proj in zip(seeds, proj_grads):
         torch.manual_seed(seed)
         for gi, p in enumerate(trainable_params):
             z = torch.randn_like(p.data)
-            grads[gi].add_(g * z)
+            grads[gi].add_(proj * z)
+        used_directions += 1
 
-    # 平均
-    for gi in range(len(grads)):
-        grads[gi].div_(denom)
+    if used_directions > 0:
+        for gi in range(len(grads)):
+            grads[gi].div_(float(used_directions))
 
-    # 恢复训练状态
     if was_training:
         model.train()
 
-    # 返回“按参数形状”的梯度列表，训练循环里逐参数应用更新（可加权重衰减、跳过bias/LN）
     return grads
+
+
+def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels):
+    """执行一次标准BP，返回loss和每个参数的梯度副本。"""
+    for p in trainable_params:
+        if p.grad is not None:
+            p.grad.zero_()
+
+    with torch.enable_grad():
+        logits = model(inputs).logits
+        loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+    loss.backward()
+
+    grads = []
+    for p in trainable_params:
+        if p.grad is None:
+            grads.append(torch.zeros_like(p.data))
+        else:
+            grads.append(p.grad.detach().clone())
+
+    model.zero_grad(set_to_none=False)
+
+    return loss.detach(), grads
+
+
+def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_norm_sq):
+    """生成与BP梯度方向保持给定余弦相似度的方向迭代器。"""
+    if not bp_grads or q is None or q <= 0:
+        return None
+
+    if total_norm <= 1e-12:
+        return None
+
+    cosine_target = float(cosine_target)
+    cosine_target = max(min(cosine_target, 0.9999), -0.9999)
+    orth_scale = math.sqrt(max(0.0, 1.0 - cosine_target ** 2))
+    eps = 1e-12
+
+    def generator():
+        for _ in range(q):
+            noises = None
+            for _attempt in range(6):
+                noises = [torch.randn_like(g) for g in bp_grads]
+                dot = 0.0
+                for noise, grad in zip(noises, bp_grads):
+                    dot += float(torch.sum(noise * grad).item())
+                proj_coeff = dot / (total_norm_sq + eps)
+                for i in range(len(noises)):
+                    noises[i] = noises[i] - proj_coeff * bp_grads[i]
+
+                noise_norm_sq = 0.0
+                for noise in noises:
+                    noise_norm_sq += float(torch.sum(noise * noise).item())
+
+                if noise_norm_sq > eps:
+                    noise_norm = math.sqrt(noise_norm_sq)
+                    for i in range(len(noises)):
+                        noises[i] = noises[i] / (noise_norm + eps)
+                    break
+            else:
+                noises = [torch.randn_like(g) for g in bp_grads]
+                noise_norm_sq = sum(float(torch.sum(n * n).item()) for n in noises) + eps
+                noise_norm = math.sqrt(noise_norm_sq)
+                for i in range(len(noises)):
+                    noises[i] = noises[i] / (noise_norm + eps)
+
+            direction = []
+            for grad, noise in zip(bp_grads, noises):
+                dir_tensor = cosine_target * grad + orth_scale * total_norm * noise
+                direction.append(dir_tensor)
+            yield direction
+
+    return generator()
 
 
 # --- 3.5. 优化器实现 (Optimizer Implementations) ---
@@ -335,7 +454,7 @@ class MuDaMWOptimizer:
 
 # --- 4. 训练循环 (Training Loops) ---
 
-def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=None, log_interval=10, optimizer_type='sgd'):
+def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=None, log_interval=10, optimizer_type='sgd', bp_interval=None):
     """主训练函数"""
     
     # 设置
@@ -359,6 +478,12 @@ def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=No
     for p in trainable_params:
         p.requires_grad = True
 
+    zo_like_modes = {'ZO', 'Calibrate', 'Instruct'}
+
+    if mode in {'Calibrate', 'Instruct'}:
+        if bp_interval is None or bp_interval <= 0:
+            raise ValueError(f"Mode '{mode}' requires bp_interval > 0.")
+
     # 初始化优化器和损失函数
     optimizer = None
     if mode == 'FO':
@@ -371,7 +496,7 @@ def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=No
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_type}")
         print(f"Using optimizer: {optimizer_type.upper()}")
-    elif mode == 'ZO':
+    elif mode in zo_like_modes:
         if optimizer_type == 'sgd':
             optimizer = None  # 使用 vanilla SGD（手动更新）
             print(f"Using optimizer: Vanilla SGD (manual update)")
@@ -394,7 +519,20 @@ def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=No
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['timestamp', 'epoch', 'step', 'mode', 'scope', 'q', 'lr', 'batch_size', 'optimizer', 'loss', 'grad_norm'])
+            writer.writerow([
+                'timestamp',
+                'epoch',
+                'step',
+                'mode',
+                'scope',
+                'q',
+                'lr',
+                'batch_size',
+                'optimizer',
+                'bp_interval',
+                'loss',
+                'grad_norm'
+            ])
     
     # 开始训练
     model.train()
@@ -423,32 +561,75 @@ def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=No
                 
                 optimizer.step()
             
-            elif mode == 'ZO':
-                # 在更新前计算当前步的损失用于记录
-                with torch.no_grad():
-                    current_logits = model(inputs).logits
-                    loss = loss_fn(current_logits.view(-1, current_logits.size(-1)), labels.view(-1))
+            elif mode in zo_like_modes:
+                should_use_bp = (
+                    mode in {'Calibrate', 'Instruct'}
+                    and bp_interval is not None
+                    and bp_interval > 0
+                    and ((step + 1) % bp_interval == 0)
+                )
 
-                # 使用 ZO 估计梯度
-                epsilon = 1e-4 # 增大扰动大小以提高数值稳定性
-                grad_paramwise = zo_gradient_estimator(model, trainable_params, loss_fn, inputs, labels, q, epsilon, device)
-                
-                # 添加梯度范数监控（组合范数）
+                bp_grads = None
+                if should_use_bp:
+                    loss, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
+                else:
+                    with torch.no_grad():
+                        current_logits = model(inputs).logits
+                        loss = loss_fn(current_logits.view(-1, current_logits.size(-1)), labels.view(-1))
+
+                epsilon = 1e-4  # 增大扰动大小以提高数值稳定性
+
+                manual_dirs = None
+                total_norm_sq = None
+                total_norm = None
+                if mode == 'Instruct' and should_use_bp and bp_grads is not None:
+                    total_norm_sq = 0.0
+                    for g in bp_grads:
+                        total_norm_sq += float(torch.sum(g * g).item())
+                    total_norm = math.sqrt(total_norm_sq)
+                    if total_norm > 0.0:
+                        manual_dirs = generate_instruct_directions(
+                            bp_grads,
+                            q,
+                            INSTRUCT_COSINE_TARGET,
+                            total_norm,
+                            total_norm_sq,
+                        )
+                    if manual_dirs is None and total_norm is not None and total_norm > 0.0:
+                        manual_dirs = ([g / total_norm for g in bp_grads],)
+
+                grad_paramwise = zo_gradient_estimator(
+                    model,
+                    trainable_params,
+                    loss_fn,
+                    inputs,
+                    labels,
+                    q,
+                    epsilon,
+                    device,
+                    manual_directions=manual_dirs
+                )
+
+                # TODO: 把这里二者的关系变成一个超参数。
+                if mode == 'Calibrate' and should_use_bp and bp_grads is not None:
+                    # grad_paramwise = [
+                        # 0.5 * (gz + gb)
+                        # for gz, gb in zip(grad_paramwise, bp_grads)
+                    # ]
+                    grad_paramwise = bp_grads
+
                 grad_norm_sq = 0.0
                 for g in grad_paramwise:
                     if g is not None:
                         grad_norm_sq += float(torch.sum(g.detach() * g.detach()).item())
                 grad_norm = math.sqrt(grad_norm_sq)
-                
-                # 应用梯度更新
+
                 if optimizer is None:
-                    # 手动应用梯度更新 (Vanilla SGD step)
                     for p, g in zip(trainable_params, grad_paramwise):
                         if g is None:
                             continue
                         p.data -= lr * g
                 else:
-                    # 使用自定义优化器（Adam 或 MuDaMW）
                     optimizer.step(grads=grad_paramwise)
 
             losses.append(loss.item())
@@ -458,28 +639,46 @@ def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=No
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 with open(csv_file, 'a', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow([timestamp, epoch+1, step, mode, scope, q if mode=='ZO' else 'N/A', lr, batch_size, optimizer_type, loss.item(), grad_norm])
+                    row_q = q if mode in zo_like_modes else 'N/A'
+                    row_bp_interval = bp_interval if mode in {'Calibrate', 'Instruct'} else 'N/A'
+                    writer.writerow([
+                        timestamp,
+                        epoch + 1,
+                        step,
+                        mode,
+                        scope,
+                        row_q,
+                        lr,
+                        batch_size,
+                        optimizer_type,
+                        row_bp_interval,
+                        loss.item(),
+                        grad_norm
+                    ])
             
-            if mode == 'ZO':
-                pbar.set_postfix({
-                    "loss": f"{loss.item():.4f}", 
-                    "grad_norm": f"{grad_norm:.4f}",
-                    "queries": f"{q}",
-                    "opt": optimizer_type
-                })
-            else:
-                pbar.set_postfix({
-                    "loss": f"{loss.item():.4f}",
-                    "grad_norm": f"{grad_norm:.4f}",
-                    "opt": optimizer_type
-                })
+            postfix = {
+                "loss": f"{loss.item():.4f}",
+                "grad_norm": f"{grad_norm:.4f}",
+                "opt": optimizer_type
+            }
+            if mode in zo_like_modes:
+                postfix["queries"] = f"{q}"
+                if mode in {'Calibrate', 'Instruct'} and bp_interval is not None and bp_interval > 0:
+                    postfix["bp_int"] = bp_interval
+
+            pbar.set_postfix(postfix)
             
             step += 1
 
     # --- 5. 结果可视化 (Result Visualization) ---
     plt.figure(figsize=(12, 6))
     plt.plot(losses)
-    plt.title(f'Training Loss Curve\nMode={mode}, Scope={scope}, q={q if mode=="ZO" else "N/A"}, LR={lr}, Optimizer={optimizer_type.upper()}')
+    q_text = q if mode in zo_like_modes else 'N/A'
+    bp_text = bp_interval if mode in {'Calibrate', 'Instruct'} else 'N/A'
+    plt.title(
+        f'Training Loss Curve\nMode={mode}, Scope={scope}, q={q_text}, BP-Interval={bp_text}, '
+        f'LR={lr}, Optimizer={optimizer_type.upper()}'
+    )
     plt.xlabel('Training Steps')
     plt.ylabel('Cross-Entropy Loss')
     plt.grid(True)
@@ -491,7 +690,7 @@ def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=No
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Reproduce 'Zeroth Order Optimization for Pretraining Language Models' paper's vanilla solver experiment.")
-    parser.add_argument("--mode", type=str, required=True, choices=['FO', 'ZO'], help="Optimization mode: First-Order (FO) or Zeroth-Order (ZO).")
+    parser.add_argument("--mode", type=str, required=True, choices=['FO', 'ZO', 'Calibrate', 'Instruct'], help="Optimization mode.")
     parser.add_argument("--scope", type=str, default='reduced', choices=['full', 'reduced'], help="Training scope: 'full' model or 'reduced' (last layer only).")
     parser.add_argument("--query_budget_q", type=int, default=1, help="Query budget (q) for ZO. Number of random directions.")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate.")
@@ -501,6 +700,7 @@ if __name__ == "__main__":
                         help="Optimizer type: SGD (vanilla), Adam, or MuDaMW.")
     parser.add_argument("--csv_file", type=str, default=None, help="CSV file to save training logs.")
     parser.add_argument("--log_interval", type=int, default=10, help="Log interval for CSV (every N steps).")
+    parser.add_argument("--bp_interval", type=int, default=0, help="Backprop interval for hybrid modes (Calibrate/Instruct). Set > 0 to enable.")
     
     args = parser.parse_args()
 
@@ -510,15 +710,19 @@ if __name__ == "__main__":
     # 创建文件名
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
-    plot_filename = f"{args.mode}_{args.scope}_q{args.query_budget_q if args.mode == 'ZO' else 'na'}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}.png"
+    q_str = args.query_budget_q if args.mode in {'ZO', 'Calibrate', 'Instruct'} else 'na'
+    bp_str = args.bp_interval if args.mode in {'Calibrate', 'Instruct'} else 'na'
+    plot_filename = f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}.png"
     
     # 生成CSV文件名（如果未指定）
     if args.csv_file is None:
-        csv_filename = f"{args.mode}_{args.scope}_q{args.query_budget_q if args.mode == 'ZO' else 'na'}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}.csv"
+        csv_filename = f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}.csv"
         csv_file = results_dir / csv_filename
     else:
         csv_file = args.csv_file
     
+    bp_interval_arg = args.bp_interval if args.bp_interval > 0 else None
+
     train(
         mode=args.mode,
         scope=args.scope,
@@ -530,5 +734,6 @@ if __name__ == "__main__":
         plot_file=results_dir / plot_filename,
         csv_file=csv_file,
         log_interval=args.log_interval,
-        optimizer_type=args.optimizer
+        optimizer_type=args.optimizer,
+        bp_interval=bp_interval_arg
     )

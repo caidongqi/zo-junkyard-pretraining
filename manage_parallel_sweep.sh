@@ -133,7 +133,7 @@ main_loop() {
             esac
         fi
 
-        read -rp "Select job to kill ([1-${#DISPLAY_PIDS[@]}], a=kill all, r=refresh, q=quit): " choice
+        read -rp "Select job to kill ([1-${#DISPLAY_PIDS[@]}], e.g. 1 3 4; a=kill all, r=refresh, q=quit): " choice
 
         case "$choice" in
             q|Q)
@@ -148,15 +148,25 @@ main_loop() {
                 done
                 ;;
             *)
-                if [[ "$choice" =~ ^[0-9]+$ ]]; then
-                    local index=$((choice - 1))
-                    if [ "$index" -ge 0 ] && [ "$index" -lt "${#DISPLAY_PIDS[@]}" ]; then
-                        kill_job "${DISPLAY_PIDS[$index]}"
+                local invalid=false
+                local killed_any=false
+                for token in $choice; do
+                    if [[ "$token" =~ ^[0-9]+$ ]]; then
+                        local index=$((token - 1))
+                        if [ "$index" -ge 0 ] && [ "$index" -lt "${#DISPLAY_PIDS[@]}" ]; then
+                            kill_job "${DISPLAY_PIDS[$index]}"
+                            killed_any=true
+                        else
+                            echo "Invalid selection: $token"
+                            invalid=true
+                        fi
                     else
-                        echo "Invalid selection: $choice"
+                        echo "Unrecognized input token: $token"
+                        invalid=true
                     fi
-                else
-                    echo "Unrecognized input: $choice"
+                done
+                if [ "$invalid" = false ] && [ "$killed_any" = false ]; then
+                    echo "No valid job indices provided."
                 fi
                 ;;
         esac
