@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# python plot_log.py --log-root /data/cdq/current_project/zo-test-cdq --output results/job_loss_plot.png
+# python plot_log.py --log-root /data/cdq/current_project/zo-test-cdq/log_data/ --output plots/log_plot.png
 def main() -> None:
     args = parse_args()
     series = load_all_losses(args.log_root, args.max_points)

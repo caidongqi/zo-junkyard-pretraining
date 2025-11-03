@@ -125,8 +125,19 @@ def get_dataloader(tokenizer, batch_size=4, block_size=128, cache_dir="cache"):
 # --- 3. 核心算法：ZO 梯度估计 (Core Algorithm: ZO Gradient Estimator) ---
 
 @torch.no_grad()
-def zo_gradient_estimator(model, trainable_params, loss_fn, inputs, labels, q, epsilon, device, manual_directions=None):
-    """ZO梯度估计器，支持可迭代的手动方向序列。"""
+def zo_gradient_estimator(
+    model,
+    trainable_params,
+    loss_fn,
+    inputs,
+    labels,
+    q,
+    epsilon,
+    device,
+    manual_directions=None,
+    data_provider=None,
+):
+    """ZO梯度估计器，支持可迭代的手动方向序列，可选地为每个查询提供独立数据。"""
     # 关闭dropout，加速且去噪
     was_training = model.training
     model.eval()
@@ -134,9 +145,19 @@ def zo_gradient_estimator(model, trainable_params, loss_fn, inputs, labels, q, e
     # 记录可训练参数的原值
     original = [p.data.clone() for p in trainable_params]
 
-    def f_loss():
-        logits = model(inputs).logits
-        return loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+    def compute_loss(batch_inputs, batch_labels):
+        logits = model(batch_inputs).logits
+        return loss_fn(logits.view(-1, logits.size(-1)), batch_labels.view(-1))
+
+    def get_batch():
+        if data_provider is None:
+            return inputs, labels
+        batch_inputs, batch_labels = data_provider()
+        if batch_inputs.device != device:
+            batch_inputs = batch_inputs.to(device)
+        if batch_labels.device != device:
+            batch_labels = batch_labels.to(device)
+        return batch_inputs, batch_labels
 
     grads = [torch.zeros_like(p.data) for p in trainable_params]
     used_directions = 0
@@ -164,13 +185,15 @@ def zo_gradient_estimator(model, trainable_params, loss_fn, inputs, labels, q, e
                     dt = dt.to(device=device, dtype=p.data.dtype)
                 direction.append(dt)
 
+            batch_inputs, batch_labels = get_batch()
+
             for p, p0, d in zip(trainable_params, original, direction):
                 p.data = p0 + epsilon * d
-            loss_pos = f_loss()
+            loss_pos = compute_loss(batch_inputs, batch_labels)
 
             for p, p0, d in zip(trainable_params, original, direction):
                 p.data = p0 - epsilon * d
-            loss_neg = f_loss()
+            loss_neg = compute_loss(batch_inputs, batch_labels)
 
             for p, p0 in zip(trainable_params, original):
                 p.data = p0.clone()
@@ -193,17 +216,19 @@ def zo_gradient_estimator(model, trainable_params, loss_fn, inputs, labels, q, e
         seed = torch.randint(0, 2**31 - 1, ()).item()
         seeds.append(seed)
 
+        batch_inputs, batch_labels = get_batch()
+
         torch.manual_seed(seed)
         for p in trainable_params:
             z = torch.randn_like(p.data)
             p.data = p.data + epsilon * z
-        loss_pos = f_loss()
+        loss_pos = compute_loss(batch_inputs, batch_labels)
 
         torch.manual_seed(seed)
         for p, p0 in zip(trainable_params, original):
             z = torch.randn_like(p.data)
             p.data = p0 - epsilon * z
-        loss_neg = f_loss()
+        loss_neg = compute_loss(batch_inputs, batch_labels)
 
         for p, p0 in zip(trainable_params, original):
             p.data = p0.clone()
@@ -454,7 +479,21 @@ class MuDaMWOptimizer:
 
 # --- 4. 训练循环 (Training Loops) ---
 
-def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=None, log_interval=10, optimizer_type='sgd', bp_interval=None):
+def train(
+    mode,
+    scope,
+    q,
+    lr,
+    epochs,
+    batch_size,
+    device,
+    plot_file,
+    csv_file=None,
+    log_interval=10,
+    optimizer_type='sgd',
+    bp_interval=None,
+    queries_use_different_data=False,
+):
     """主训练函数"""
     
     # 设置
@@ -479,6 +518,25 @@ def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=No
         p.requires_grad = True
 
     zo_like_modes = {'ZO', 'Calibrate', 'Instruct'}
+
+    query_batch_provider = None
+    if queries_use_different_data and mode in zo_like_modes:
+        query_dataloader = DataLoader(dataloader.dataset, batch_size=batch_size, shuffle=True)
+        query_iter = iter(query_dataloader)
+
+        def _next_query_batch():
+            nonlocal query_iter
+            try:
+                batch = next(query_iter)
+            except StopIteration:
+                query_iter = iter(query_dataloader)
+                batch = next(query_iter)
+            batch = batch.to(device)
+            labels = batch.clone()
+            return batch, labels
+
+        query_batch_provider = _next_query_batch
+        print("ZO queries will use fresh data batches per direction.")
 
     if mode in {'Calibrate', 'Instruct'}:
         if bp_interval is None or bp_interval <= 0:
@@ -607,7 +665,8 @@ def train(mode, scope, q, lr, epochs, batch_size, device, plot_file, csv_file=No
                     q,
                     epsilon,
                     device,
-                    manual_directions=manual_dirs
+                    manual_directions=manual_dirs,
+                    data_provider=query_batch_provider,
                 )
 
                 # TODO: 把这里二者的关系变成一个超参数。
@@ -701,6 +760,11 @@ if __name__ == "__main__":
     parser.add_argument("--csv_file", type=str, default=None, help="CSV file to save training logs.")
     parser.add_argument("--log_interval", type=int, default=10, help="Log interval for CSV (every N steps).")
     parser.add_argument("--bp_interval", type=int, default=0, help="Backprop interval for hybrid modes (Calibrate/Instruct). Set > 0 to enable.")
+    parser.add_argument(
+        "--queries_use_different_data",
+        action="store_true", default=True,
+        help="Use a fresh data batch for each ZO query instead of reusing the training batch.",
+    )
     
     args = parser.parse_args()
 
@@ -735,5 +799,6 @@ if __name__ == "__main__":
         csv_file=csv_file,
         log_interval=args.log_interval,
         optimizer_type=args.optimizer,
-        bp_interval=bp_interval_arg
+        bp_interval=bp_interval_arg,
+        queries_use_different_data=args.queries_use_different_data,
     )
