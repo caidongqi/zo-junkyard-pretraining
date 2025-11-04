@@ -11,39 +11,20 @@ import torch
 from torch.utils.data import DataLoader
 from torch.nn import CrossEntropyLoss
 import transformers
-from transformers import GPT2Config, GPT2LMHeadModel, AutoTokenizer
-from datasets import load_dataset
+from transformers import AutoTokenizer
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+
+# 导入自定义模块
+from model import create_model
+from data import get_dataloader
 
 # --- 常量配置 (Constants) ---
 
 INSTRUCT_COSINE_TARGET = 0.9
 
 # --- 1. 配置与模型定义 (Configuration and Model Definition) ---
-
-def create_model(vocab_size):
-    """
-    创建一个参数量级在 20M 左右的轻量级 GPT-2 模型。
-    这与论文中使用的 Llama2-20M 类似，用于复现实验。
-    """
-    print("Initializing a small GPT-2 model (~20M parameters)...")
-    config = GPT2Config(
-        vocab_size=vocab_size,
-        n_positions=512,
-        n_embd=768,
-        n_layer=24,
-        n_head=32,
-        bos_token_id=vocab_size - 1,
-        eos_token_id=vocab_size - 1,
-    )
-    model = GPT2LMHeadModel(config)
-    
-    # 计算并打印模型参数量
-    params_total = sum(p.numel() for p in model.parameters())
-    print(f"Model created. Total parameters: {params_total / 1e6:.2f}M")
-    
-    return model
+# 注意: create_model 函数现在从 model.py 导入
 
 def get_trainable_parameters(model, scope='full'):
     """
@@ -73,53 +54,7 @@ def get_trainable_parameters(model, scope='full'):
         raise ValueError(f"Unknown training scope: {scope}")
 
 # --- 2. 数据加载与预处理 (Data Loading and Preprocessing) ---
-
-def get_dataloader(tokenizer, batch_size=4, block_size=128, cache_dir="cache"):
-    """
-    加载 cosmopedia-100k 数据集并进行预处理。
-    支持缓存以避免重复加载。
-    """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(exist_ok=True)
-    
-    # 创建缓存文件名
-    cache_file = cache_dir / f"dataset_bs{block_size}_samples20000.pkl"
-    
-    # 检查缓存是否存在
-    if cache_file.exists():
-        print(f"Loading dataset from cache: {cache_file}")
-        with open(cache_file, 'rb') as f:
-            examples = pickle.load(f)
-        print(f"Dataset loaded from cache. Total samples: {len(examples)}")
-        return DataLoader(examples, batch_size=batch_size, shuffle=True)
-    
-    print("Loading and preprocessing cosmopedia-100k dataset...")
-    # 为了快速演示，我们只使用一小部分数据
-    dataset = load_dataset("HuggingFaceTB/cosmopedia-100k", split="train", streaming=True)
-    dataset = dataset.take(20000) # 使用20k个样本进行训练
-
-    def tokenize_function(examples):
-        # 使用长文本合并和分块的方式来创建样本
-        text = "".join(examples["text"])
-        return tokenizer(text, truncation=False)
-
-    tokenized_texts = []
-    for example in tqdm(dataset, desc="Reading dataset"):
-        tokenized_texts.extend(tokenize_function(example)["input_ids"])
-    
-    # 将所有文本分块
-    examples = []
-    for i in range(0, len(tokenized_texts) - block_size + 1, block_size):
-        examples.append(torch.tensor(tokenized_texts[i:i + block_size], dtype=torch.long))
-
-    print(f"Dataset prepared. Total samples: {len(examples)}")
-    
-    # 保存到缓存
-    print(f"Saving dataset to cache: {cache_file}")
-    with open(cache_file, 'wb') as f:
-        pickle.dump(examples, f)
-    
-    return DataLoader(examples, batch_size=batch_size, shuffle=True)
+# 注意: get_dataloader 函数现在从 data.py 导入
 
 
 # --- 3. 核心算法：ZO 梯度估计 (Core Algorithm: ZO Gradient Estimator) ---
@@ -147,7 +82,11 @@ def zo_gradient_estimator(
 
     def compute_loss(batch_inputs, batch_labels):
         logits = model(batch_inputs).logits
-        return loss_fn(logits.view(-1, logits.size(-1)), batch_labels.view(-1))
+        # Shift logits and labels for next-token prediction
+        # logits[..., :-1, :] predicts labels[..., 1:]
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = batch_labels[..., 1:].contiguous()
+        return loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
     def get_batch():
         if data_provider is None:
@@ -261,7 +200,10 @@ def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
 
     with torch.enable_grad():
         logits = model(inputs).logits
-        loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+        # Shift logits and labels for next-token prediction
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
     loss.backward()
 
@@ -493,6 +435,9 @@ def train(
     optimizer_type='sgd',
     bp_interval=None,
     queries_use_different_data=False,
+    model_size='200M',
+    dataset_name='cosmopedia-100k',
+    max_samples=None,
 ):
     """主训练函数"""
     
@@ -502,8 +447,13 @@ def train(
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     
-    model = create_model(len(tokenizer)).to(device)
-    dataloader = get_dataloader(tokenizer, batch_size)
+    model = create_model(model_size=model_size, vocab_size=len(tokenizer)).to(device)
+    dataloader = get_dataloader(
+        tokenizer=tokenizer,
+        dataset_name=dataset_name,
+        batch_size=batch_size,
+        max_samples=max_samples,
+    )
     
     # 确定可训练参数
     trainable_params = get_trainable_parameters(model, scope)
@@ -607,7 +557,10 @@ def train(
                 if hasattr(optimizer, 'zero_grad'):
                     optimizer.zero_grad()
                 logits = model(inputs).logits
-                loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+                # Shift logits and labels for next-token prediction
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
                 loss.backward()
                 
                 # 计算梯度范数（用于记录）
@@ -633,7 +586,10 @@ def train(
                 else:
                     with torch.no_grad():
                         current_logits = model(inputs).logits
-                        loss = loss_fn(current_logits.view(-1, current_logits.size(-1)), labels.view(-1))
+                        # Shift logits and labels for next-token prediction
+                        shift_logits = current_logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
                 epsilon = 1e-4  # 增大扰动大小以提高数值稳定性
 
@@ -766,6 +722,18 @@ if __name__ == "__main__":
         help="Use a fresh data batch for each ZO query instead of reusing the training batch.",
     )
     
+    # 模型和数据集参数
+    parser.add_argument("--model_size", type=str, default='200M', 
+                        choices=['20M', '200M', '500M', '1B'],
+                        help="Model size: 20M (fast), 200M (GPT-2 Small), 500M (medium), 1B (large).")
+    parser.add_argument("--dataset", type=str, default='cosmopedia-100k',
+                        choices=['cosmopedia-100k', 'cosmopedia', 'wikitext-103', 'openwebtext', 
+                                'c4', 'tinystories', 'pile-subset', 'fineweb', 'fineweb-edu', 
+                                'fineweb-edu-10bt'],
+                        help="Dataset name for training.")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Maximum number of samples to use from dataset. None=use recommended value.")
+    
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -801,4 +769,7 @@ if __name__ == "__main__":
         optimizer_type=args.optimizer,
         bp_interval=bp_interval_arg,
         queries_use_different_data=args.queries_use_different_data,
+        model_size=args.model_size,
+        dataset_name=args.dataset,
+        max_samples=args.max_samples,
     )

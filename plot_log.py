@@ -40,16 +40,23 @@ def extract_losses_from_log(path: Path) -> List[float]:
     return losses
 
 
-def downsample_series(values: List[float], max_points: Optional[int]) -> List[float]:
-    if max_points is None or max_points <= 0 or len(values) <= max_points:
-        return values
+def downsample_series(values: List[float], max_points: Optional[int]) -> Tuple[List[int], List[float]]:
+    if not values:
+        return [], []
 
-    result: List[float] = []
+    steps = list(range(1, len(values) + 1))
+    if max_points is None or max_points <= 0 or len(values) <= max_points:
+        return steps, values[:]
+
     total = len(values)
+    selected_indices: List[int] = []
     for i in range(max_points):
         idx = int(round(i * (total - 1) / (max_points - 1))) if max_points > 1 else 0
-        result.append(values[idx])
-    return result
+        selected_indices.append(idx)
+
+    downsampled_steps = [steps[idx] for idx in selected_indices]
+    downsampled_values = [values[idx] for idx in selected_indices]
+    return downsampled_steps, downsampled_values
 
 
 def iter_log_files(root: Path) -> Iterable[Path]:
@@ -61,28 +68,35 @@ def iter_log_files(root: Path) -> Iterable[Path]:
                 yield log_file
 
 
-def load_all_losses(root: Path, max_points: Optional[int]) -> Dict[str, List[float]]:
-    series: Dict[str, List[float]] = {}
+def load_all_losses(root: Path, max_points: Optional[int]) -> Dict[str, Tuple[List[int], List[float]]]:
+    series: Dict[str, Tuple[List[int], List[float]]] = {}
     for log_file in iter_log_files(root):
         losses = extract_losses_from_log(log_file)
         if not losses:
             continue
-        downsampled = downsample_series(losses, max_points)
-        series[log_file.stem] = downsampled
+        steps, downsampled = downsample_series(losses, max_points)
+        series[log_file.stem] = (steps, downsampled)
     return series
 
 
-def plot_series(series: Dict[str, List[float]], output: Optional[Path], title: Optional[str]) -> None:
+def plot_series(
+    series: Dict[str, Tuple[List[int], List[float]]],
+    output: Optional[Path],
+    title: Optional[str],
+) -> None:
     if not series:
         print("No loss data found in job logs.")
         return
 
     plt.figure(figsize=(14, 7))
-    for label, losses in series.items():
-        xs = list(range(1, len(losses) + 1))
-        plt.plot(xs, losses, label=label)
+    for label, (steps, losses) in series.items():
+        plt.plot(steps, losses, label=label)
 
-    plt.xlabel("Logged Steps (downsampled)" if any(len(v) > 1 for v in series.values()) else "Logged Step")
+    plt.xlabel(
+        "Logged Steps (downsampled)"
+        if any(len(steps) > 1 for steps, _ in series.values())
+        else "Logged Step"
+    )
     plt.ylabel("Loss")
     plt.title(title or "Training Loss from job_logs_*")
     plt.legend(loc="best")
