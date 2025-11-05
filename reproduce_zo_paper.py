@@ -1,11 +1,14 @@
 import argparse
-import time
+import csv
+import json
+import logging
 import math
 import os
 import pickle
-import csv
-from pathlib import Path
+import shutil
+import time
 from datetime import datetime
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
@@ -192,6 +195,37 @@ def zo_gradient_estimator(
     return grads
 
 
+def save_latest_checkpoint(
+    model,
+    tokenizer,
+    checkpoint_dir,
+    optimizer_state=None,
+    metadata=None,
+    logger=None,
+):
+    if not checkpoint_dir:
+        return
+
+    ckpt_path = Path(checkpoint_dir)
+    if ckpt_path.exists():
+        shutil.rmtree(ckpt_path)
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+
+    model.save_pretrained(ckpt_path)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(ckpt_path / "tokenizer")
+
+    if optimizer_state is not None:
+        torch.save(optimizer_state, ckpt_path / "optimizer.pt")
+
+    if metadata is not None:
+        with open(ckpt_path / "training_state.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+    if logger is not None:
+        logger.info("Checkpoint saved to %s", ckpt_path)
+
+
 def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels):
     """执行一次标准BP，返回loss和每个参数的梯度副本。"""
     for p in trainable_params:
@@ -233,7 +267,7 @@ def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_n
     eps = 1e-12
 
     def generator():
-        for _ in range(q):
+        for idx in range(q):
             noises = None
             for _attempt in range(6):
                 noises = [torch.randn_like(g) for g in bp_grads]
@@ -264,6 +298,19 @@ def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_n
             for grad, noise in zip(bp_grads, noises):
                 dir_tensor = cosine_target * grad + orth_scale * total_norm * noise
                 direction.append(dir_tensor)
+            
+            # 计算实际的余弦相似度并打印日志
+            dot_product = 0.0
+            direction_norm_sq = 0.0
+            for dir_t, grad in zip(direction, bp_grads):
+                dot_product += float(torch.sum(dir_t * grad).item())
+                direction_norm_sq += float(torch.sum(dir_t * dir_t).item())
+            
+            direction_norm = math.sqrt(direction_norm_sq + eps)
+            actual_cosine_sim = dot_product / (direction_norm * total_norm + eps)
+            
+            print(f"[Instruct] Perturbation {idx+1}/{q}: cosine_similarity={actual_cosine_sim:.6f}, target={cosine_target:.6f}")
+            
             yield direction
 
     return generator()
@@ -335,6 +382,33 @@ class CustomAdamOptimizer:
             v_hat = self.v[i] / (1 - self.beta2 ** self.t)
             
             p.data -= self.lr * m_hat / (torch.sqrt(v_hat) + self.epsilon)
+
+    def state_dict(self):
+        return {
+            'lr': self.lr,
+            'beta1': self.beta1,
+            'beta2': self.beta2,
+            'epsilon': self.epsilon,
+            't': self.t,
+            'm': [m.clone() for m in self.m],
+            'v': [v.clone() for v in self.v],
+        }
+
+    def load_state_dict(self, state):
+        self.lr = state.get('lr', self.lr)
+        self.beta1 = state.get('beta1', self.beta1)
+        self.beta2 = state.get('beta2', self.beta2)
+        self.epsilon = state.get('epsilon', self.epsilon)
+        self.t = state.get('t', 0)
+
+        m_state = state.get('m', [])
+        v_state = state.get('v', [])
+        if len(m_state) != len(self.m) or len(v_state) != len(self.v):
+            raise ValueError("State dict does not match parameter groups for CustomAdamOptimizer")
+
+        for i in range(len(self.m)):
+            self.m[i] = m_state[i].clone().to(device=self.params[i].device, dtype=self.params[i].dtype)
+            self.v[i] = v_state[i].clone().to(device=self.params[i].device, dtype=self.params[i].dtype)
 
 class MuDaMWOptimizer:
     """MuDaMW 优化器（基于 flwr_server.py 的实现）"""
@@ -419,6 +493,41 @@ class MuDaMWOptimizer:
             
             p.data.add_(norm_grad, alpha=-step)
 
+    def state_dict(self):
+        return {
+            'lr': self.lr,
+            'beta1': self.beta1,
+            'beta2': self.beta2,
+            'epsilon': self.epsilon,
+            'weight_decay': self.weight_decay,
+            'correct_bias': self.correct_bias,
+            'cautious': self.cautious,
+            'hidden_size': self.hidden_size,
+            't': self.t,
+            'exp_avg': [buf.clone() for buf in self.exp_avg],
+            'exp_avg_sq': [buf.clone() for buf in self.exp_avg_sq],
+        }
+
+    def load_state_dict(self, state):
+        self.lr = state.get('lr', self.lr)
+        self.beta1 = state.get('beta1', self.beta1)
+        self.beta2 = state.get('beta2', self.beta2)
+        self.epsilon = state.get('epsilon', self.epsilon)
+        self.weight_decay = state.get('weight_decay', self.weight_decay)
+        self.correct_bias = state.get('correct_bias', self.correct_bias)
+        self.cautious = state.get('cautious', self.cautious)
+        self.hidden_size = state.get('hidden_size', self.hidden_size)
+        self.t = state.get('t', 0)
+
+        exp_avg_state = state.get('exp_avg', [])
+        exp_avg_sq_state = state.get('exp_avg_sq', [])
+        if len(exp_avg_state) != len(self.exp_avg) or len(exp_avg_sq_state) != len(self.exp_avg_sq):
+            raise ValueError("State dict does not match parameter groups for MuDaMWOptimizer")
+
+        for i in range(len(self.exp_avg)):
+            self.exp_avg[i] = exp_avg_state[i].clone().to(device=self.params[i].device, dtype=self.params[i].dtype)
+            self.exp_avg_sq[i] = exp_avg_sq_state[i].clone().to(device=self.params[i].device, dtype=self.params[i].dtype)
+
 # --- 4. 训练循环 (Training Loops) ---
 
 def train(
@@ -438,6 +547,9 @@ def train(
     model_size='200M',
     dataset_name='cosmopedia-100k',
     max_samples=None,
+    checkpoint_dir=None,
+    logger=None,
+    run_name=None,
 ):
     """主训练函数"""
     
@@ -454,12 +566,44 @@ def train(
         batch_size=batch_size,
         max_samples=max_samples,
     )
+
+    csv_path = Path(csv_file) if csv_file else None
+    checkpoint_path = Path(checkpoint_dir) if checkpoint_dir else None
+    if csv_path:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if checkpoint_path:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if logger:
+        logger.info(
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s optimizer=%s bp_interval=%s device=%s dataset=%s model_size=%s max_samples=%s",
+            run_name or "unnamed",
+            mode,
+            scope,
+            q,
+            lr,
+            epochs,
+            batch_size,
+            optimizer_type,
+            bp_interval,
+            device,
+            dataset_name,
+            model_size,
+            max_samples,
+        )
     
     # 确定可训练参数
     trainable_params = get_trainable_parameters(model, scope)
     params_trainable = sum(p.numel() for p in trainable_params)
     params_total = sum(p.numel() for p in model.parameters())
     print(f"Trainable parameters: {params_trainable / 1e6:.2f}M ({params_trainable*100/params_total:.2f}% of total)")
+    if logger:
+        logger.info(
+            "Trainable parameters: %.2fM (%.2f%% of total %.2fM)",
+            params_trainable / 1e6,
+            params_trainable * 100 / params_total,
+            params_total / 1e6,
+        )
 
     # 冻结非训练参数
     for p in model.parameters():
@@ -487,6 +631,8 @@ def train(
 
         query_batch_provider = _next_query_batch
         print("ZO queries will use fresh data batches per direction.")
+        if logger:
+            logger.info("ZO queries will use fresh data batches per direction.")
 
     if mode in {'Calibrate', 'Instruct'}:
         if bp_interval is None or bp_interval <= 0:
@@ -504,16 +650,24 @@ def train(
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_type}")
         print(f"Using optimizer: {optimizer_type.upper()}")
+        if logger:
+            logger.info("Using optimizer: %s", optimizer_type.upper())
     elif mode in zo_like_modes:
         if optimizer_type == 'sgd':
             optimizer = None  # 使用 vanilla SGD（手动更新）
             print(f"Using optimizer: Vanilla SGD (manual update)")
+            if logger:
+                logger.info("Using optimizer: Vanilla SGD (manual update)")
         elif optimizer_type == 'adam':
             optimizer = CustomAdamOptimizer(trainable_params, lr=lr)
             print(f"Using optimizer: Custom Adam")
+            if logger:
+                logger.info("Using optimizer: Custom Adam")
         elif optimizer_type == 'mudamw':
             optimizer = MuDaMWOptimizer(trainable_params, lr=lr)
             print(f"Using optimizer: MuDaMW")
+            if logger:
+                logger.info("Using optimizer: MuDaMW")
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_type}")
     
@@ -522,9 +676,7 @@ def train(
     losses = []
     
     # 初始化CSV日志
-    if csv_file:
-        csv_path = Path(csv_file)
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if csv_path:
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -545,8 +697,16 @@ def train(
     # 开始训练
     model.train()
     step = 0
+    last_metrics = {
+        'loss': None,
+        'grad_norm': None,
+        'epoch': None,
+        'step': None,
+    }
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        if logger:
+            logger.info("Epoch %s/%s started", epoch + 1, epochs)
         for batch in pbar:
             inputs = batch.to(device)
             labels = inputs.clone()
@@ -648,28 +808,85 @@ def train(
                     optimizer.step(grads=grad_paramwise)
 
             losses.append(loss.item())
-            
-            # 记录到CSV（每log_interval步记录一次）
-            if csv_file and step % log_interval == 0:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                with open(csv_file, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    row_q = q if mode in zo_like_modes else 'N/A'
-                    row_bp_interval = bp_interval if mode in {'Calibrate', 'Instruct'} else 'N/A'
-                    writer.writerow([
-                        timestamp,
+            current_step = step
+            last_metrics.update({
+                'loss': float(loss.item()),
+                'grad_norm': float(grad_norm),
+                'epoch': epoch + 1,
+                'step': current_step,
+            })
+
+            # 记录到CSV / 日志 / checkpoint（每 log_interval 步）
+            should_log_step = (log_interval > 0) and (current_step % log_interval == 0)
+            if should_log_step:
+                timestamp_dt = datetime.now()
+                timestamp = timestamp_dt.strftime("%Y-%m-%d %H:%M:%S")
+                row_q = q if mode in zo_like_modes else 'N/A'
+                row_bp_interval = bp_interval if mode in {'Calibrate', 'Instruct'} else 'N/A'
+
+                if csv_path:
+                    with open(csv_path, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            timestamp,
+                            epoch + 1,
+                            current_step,
+                            mode,
+                            scope,
+                            row_q,
+                            lr,
+                            batch_size,
+                            optimizer_type,
+                            row_bp_interval,
+                            loss.item(),
+                            grad_norm
+                        ])
+
+                if logger:
+                    logger.info(
+                        "step=%s epoch=%s loss=%.6f grad_norm=%.6f mode=%s scope=%s q=%s bp_interval=%s",
+                        current_step,
                         epoch + 1,
-                        step,
+                        loss.item(),
+                        grad_norm,
                         mode,
                         scope,
                         row_q,
-                        lr,
-                        batch_size,
-                        optimizer_type,
                         row_bp_interval,
-                        loss.item(),
-                        grad_norm
-                    ])
+                    )
+
+                if checkpoint_path:
+                    optimizer_state = None
+                    if optimizer is not None and hasattr(optimizer, 'state_dict'):
+                        optimizer_state = optimizer.state_dict()
+
+                    metadata = {
+                        'timestamp': timestamp_dt.isoformat(),
+                        'run_name': run_name,
+                        'mode': mode,
+                        'scope': scope,
+                        'epoch': epoch + 1,
+                        'step': current_step,
+                        'q': q if mode in zo_like_modes else None,
+                        'learning_rate': lr,
+                        'batch_size': batch_size,
+                        'optimizer': optimizer_type,
+                        'bp_interval': bp_interval if mode in {'Calibrate', 'Instruct'} else None,
+                        'loss': float(loss.item()),
+                        'grad_norm': float(grad_norm),
+                        'device': device,
+                        'model_size': model_size,
+                        'dataset': dataset_name,
+                        'checkpoint_type': 'periodic',
+                    }
+                    save_latest_checkpoint(
+                        model,
+                        tokenizer,
+                        checkpoint_path,
+                        optimizer_state=optimizer_state,
+                        metadata=metadata,
+                        logger=logger,
+                    )
             
             postfix = {
                 "loss": f"{loss.item():.4f}",
@@ -684,6 +901,43 @@ def train(
             pbar.set_postfix(postfix)
             
             step += 1
+        if logger:
+            logger.info("Epoch %s/%s completed", epoch + 1, epochs)
+
+    if checkpoint_path and last_metrics['loss'] is not None:
+        optimizer_state = None
+        if optimizer is not None and hasattr(optimizer, 'state_dict'):
+            optimizer_state = optimizer.state_dict()
+        final_metadata = {
+            'timestamp': datetime.now().isoformat(),
+            'run_name': run_name,
+            'mode': mode,
+            'scope': scope,
+            'epoch': last_metrics['epoch'],
+            'step': last_metrics['step'],
+            'q': q if mode in zo_like_modes else None,
+            'learning_rate': lr,
+            'batch_size': batch_size,
+            'optimizer': optimizer_type,
+            'bp_interval': bp_interval if mode in {'Calibrate', 'Instruct'} else None,
+            'loss': last_metrics['loss'],
+            'grad_norm': last_metrics['grad_norm'],
+            'device': device,
+            'model_size': model_size,
+            'dataset': dataset_name,
+            'checkpoint_type': 'final',
+        }
+        save_latest_checkpoint(
+            model,
+            tokenizer,
+            checkpoint_path,
+            optimizer_state=optimizer_state,
+            metadata=final_metadata,
+            logger=logger,
+        )
+
+    if logger:
+        logger.info("Training complete. Total steps: %s", step)
 
     # --- 5. 结果可视化 (Result Visualization) ---
     plt.figure(figsize=(12, 6))
@@ -721,6 +975,10 @@ if __name__ == "__main__":
         action="store_true", default=True,
         help="Use a fresh data batch for each ZO query instead of reusing the training batch.",
     )
+    parser.add_argument("--log_dir", type=str, default=None, help="Directory to store run logs. Defaults to logs/<run_name>_<timestamp>.")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="Directory to store the latest checkpoint. Defaults to <log_dir>/checkpoint.")
+    parser.add_argument("--disable_checkpoint", action="store_true", help="Disable checkpoint saving.")
+    parser.add_argument("--run_name", type=str, default=None, help="Optional run name to organize logs and checkpoints.")
     
     # 模型和数据集参数
     parser.add_argument("--model_size", type=str, default='200M', 
@@ -739,20 +997,59 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    # 创建文件名
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
+    run_start = datetime.now()
+    timestamp_str = run_start.strftime("%Y%m%d_%H%M%S")
+
     q_str = args.query_budget_q if args.mode in {'ZO', 'Calibrate', 'Instruct'} else 'na'
     bp_str = args.bp_interval if args.mode in {'Calibrate', 'Instruct'} else 'na'
-    plot_filename = f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}.png"
-    
-    # 生成CSV文件名（如果未指定）
-    if args.csv_file is None:
-        csv_filename = f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}.csv"
-        csv_file = results_dir / csv_filename
+    default_run_name = f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}"
+    run_name = args.run_name or default_run_name
+
+    if args.log_dir:
+        run_log_dir = Path(args.log_dir)
+        if not run_log_dir.is_absolute():
+            run_log_dir = Path.cwd() / run_log_dir
     else:
-        csv_file = args.csv_file
-    
+        base_log_dir = Path.cwd() / "logs"
+        run_log_dir = base_log_dir / f"{run_name}_{timestamp_str}"
+
+    run_log_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Logs will be stored in {run_log_dir}")
+
+    log_file = run_log_dir / f"training_{timestamp_str}.log"
+    logger = logging.getLogger(f"reproduce_zo_paper.{run_name}")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(file_handler)
+    logger.propagate = False
+    logger.info("Run directory initialized at %s", run_log_dir)
+
+    if args.csv_file is None:
+        csv_file_path = run_log_dir / f"{run_name}.csv"
+    else:
+        csv_file_path = Path(args.csv_file)
+        if not csv_file_path.is_absolute():
+            csv_file_path = run_log_dir / csv_file_path
+
+    if args.disable_checkpoint:
+        checkpoint_path = None
+    else:
+        if args.checkpoint_dir:
+            checkpoint_path = Path(args.checkpoint_dir)
+            if not checkpoint_path.is_absolute():
+                checkpoint_path = run_log_dir / args.checkpoint_dir
+        else:
+            checkpoint_path = run_log_dir / "checkpoint"
+
+    if checkpoint_path:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    plot_filename = f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}.png"
+
     bp_interval_arg = args.bp_interval if args.bp_interval > 0 else None
 
     train(
@@ -764,7 +1061,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         device=device,
         plot_file=results_dir / plot_filename,
-        csv_file=csv_file,
+        csv_file=str(csv_file_path),
         log_interval=args.log_interval,
         optimizer_type=args.optimizer,
         bp_interval=bp_interval_arg,
@@ -772,4 +1069,21 @@ if __name__ == "__main__":
         model_size=args.model_size,
         dataset_name=args.dataset,
         max_samples=args.max_samples,
+        checkpoint_dir=str(checkpoint_path) if checkpoint_path else None,
+        logger=logger,
+        run_name=run_name,
     )
+
+    print(f"CSV metrics saved to {csv_file_path}")
+    if checkpoint_path:
+        print(f"Latest checkpoint stored at {checkpoint_path}")
+        logger.info("Latest checkpoint stored at %s", checkpoint_path)
+    else:
+        print("Checkpoint saving disabled.")
+        logger.info("Checkpoint saving disabled.")
+    print(f"Training logs saved to {log_file}")
+    logger.info("Training logs saved to %s", log_file)
+
+    for handler in logger.handlers:
+        handler.close()
+    logger.handlers.clear()
