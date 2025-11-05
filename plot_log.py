@@ -98,6 +98,7 @@ def plot_series(
         else "Logged Step"
     )
     plt.ylabel("Loss")
+    plt.xlim(0,50000)
     plt.title(title or "Training Loss from job_logs_*")
     plt.legend(loc="best")
     plt.grid(True, alpha=0.3)

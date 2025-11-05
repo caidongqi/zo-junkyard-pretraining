@@ -299,17 +299,17 @@ def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_n
                 dir_tensor = cosine_target * grad + orth_scale * total_norm * noise
                 direction.append(dir_tensor)
             
-            # 计算实际的余弦相似度并打印日志
-            dot_product = 0.0
-            direction_norm_sq = 0.0
-            for dir_t, grad in zip(direction, bp_grads):
-                dot_product += float(torch.sum(dir_t * grad).item())
-                direction_norm_sq += float(torch.sum(dir_t * dir_t).item())
+            # # 计算实际的余弦相似度并打印日志
+            # dot_product = 0.0
+            # direction_norm_sq = 0.0
+            # for dir_t, grad in zip(direction, bp_grads):
+            #     dot_product += float(torch.sum(dir_t * grad).item())
+            #     direction_norm_sq += float(torch.sum(dir_t * dir_t).item())
             
-            direction_norm = math.sqrt(direction_norm_sq + eps)
-            actual_cosine_sim = dot_product / (direction_norm * total_norm + eps)
+            # direction_norm = math.sqrt(direction_norm_sq + eps)
+            # actual_cosine_sim = dot_product / (direction_norm * total_norm + eps)
             
-            print(f"[Instruct] Perturbation {idx+1}/{q}: cosine_similarity={actual_cosine_sim:.6f}, target={cosine_target:.6f}")
+            # print(f"[Instruct] Perturbation {idx+1}/{q}: cosine_similarity={actual_cosine_sim:.6f}, target={cosine_target:.6f}")
             
             yield direction
 
@@ -550,6 +550,8 @@ def train(
     checkpoint_dir=None,
     logger=None,
     run_name=None,
+    bp_dataset_name=None,
+    bp_max_samples=None,
 ):
     """主训练函数"""
     
@@ -566,6 +568,19 @@ def train(
         batch_size=batch_size,
         max_samples=max_samples,
     )
+    
+    # 为BP创建单独的dataloader（如果指定了不同的数据集）
+    bp_dataloader = None
+    if bp_dataset_name is not None and bp_dataset_name != dataset_name:
+        print(f"Creating separate BP dataloader with dataset: {bp_dataset_name}")
+        bp_dataloader = get_dataloader(
+            tokenizer=tokenizer,
+            dataset_name=bp_dataset_name,
+            batch_size=batch_size,
+            max_samples=bp_max_samples,
+        )
+        if logger:
+            logger.info("Separate BP dataloader created with dataset: %s", bp_dataset_name)
 
     csv_path = Path(csv_file) if csv_file else None
     checkpoint_path = Path(checkpoint_dir) if checkpoint_dir else None
@@ -576,7 +591,7 @@ def train(
 
     if logger:
         logger.info(
-            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s optimizer=%s bp_interval=%s device=%s dataset=%s model_size=%s max_samples=%s",
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s optimizer=%s bp_interval=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s",
             run_name or "unnamed",
             mode,
             scope,
@@ -590,6 +605,8 @@ def train(
             dataset_name,
             model_size,
             max_samples,
+            bp_dataset_name or "same_as_main",
+            bp_max_samples or "default",
         )
     
     # 确定可训练参数
@@ -633,6 +650,27 @@ def train(
         print("ZO queries will use fresh data batches per direction.")
         if logger:
             logger.info("ZO queries will use fresh data batches per direction.")
+
+    # 为BP创建单独的batch provider（如果使用单独的数据集）
+    bp_batch_provider = None
+    if bp_dataloader is not None:
+        bp_iter = iter(bp_dataloader)
+
+        def _next_bp_batch():
+            nonlocal bp_iter
+            try:
+                batch = next(bp_iter)
+            except StopIteration:
+                bp_iter = iter(bp_dataloader)
+                batch = next(bp_iter)
+            batch = batch.to(device)
+            labels = batch.clone()
+            return batch, labels
+
+        bp_batch_provider = _next_bp_batch
+        print(f"BP will use separate dataset: {bp_dataset_name}")
+        if logger:
+            logger.info("BP will use separate dataset: %s", bp_dataset_name)
 
     if mode in {'Calibrate', 'Instruct'}:
         if bp_interval is None or bp_interval <= 0:
@@ -742,7 +780,12 @@ def train(
 
                 bp_grads = None
                 if should_use_bp:
-                    loss, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
+                    # 如果有单独的BP数据集，则使用它；否则使用当前训练batch
+                    if bp_batch_provider is not None:
+                        bp_inputs, bp_labels = bp_batch_provider()
+                        loss, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, bp_inputs, bp_labels)
+                    else:
+                        loss, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
                 else:
                     with torch.no_grad():
                         current_logits = model(inputs).logits
@@ -992,6 +1035,15 @@ if __name__ == "__main__":
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Maximum number of samples to use from dataset. None=use recommended value.")
     
+    # BP数据集参数（用于Calibrate/Instruct模式）
+    parser.add_argument("--bp_dataset", type=str, default=None,
+                        choices=['cosmopedia-100k', 'cosmopedia', 'wikitext-103', 'openwebtext', 
+                                'c4', 'tinystories', 'pile-subset', 'fineweb', 'fineweb-edu', 
+                                'fineweb-edu-10bt'],
+                        help="Separate dataset for BP gradient computation (Calibrate/Instruct modes). If not specified, uses same as --dataset.")
+    parser.add_argument("--bp_max_samples", type=int, default=None,
+                        help="Maximum number of samples to use from BP dataset. None=use recommended value.")
+    
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1072,6 +1124,8 @@ if __name__ == "__main__":
         checkpoint_dir=str(checkpoint_path) if checkpoint_path else None,
         logger=logger,
         run_name=run_name,
+        bp_dataset_name=args.bp_dataset,
+        bp_max_samples=args.bp_max_samples,
     )
 
     print(f"CSV metrics saved to {csv_file_path}")
