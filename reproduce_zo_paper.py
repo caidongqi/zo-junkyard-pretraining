@@ -253,6 +253,185 @@ def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
     return loss.detach(), grads
 
 
+def generate_instruct_directions_with_R(bp_grads, q, cosine_target, total_norm, total_norm_sq):
+    """生成与BP梯度方向保持给定余弦相似度的方向迭代器，使用低秩映射R。"""
+    if not bp_grads or q is None or q <= 0:
+        return None
+    if total_norm <= 1e-12:
+        return None
+
+    cosine_target = float(cosine_target)
+    cosine_target = max(min(cosine_target, 0.9999), -0.9999)
+    orth_scale = math.sqrt(max(0.0, 1.0 - cosine_target ** 2))
+    eps = 1e-12
+
+    # 将梯度列表展平成一个长向量
+    grad_flat = torch.cat([g.flatten() for g in bp_grads])
+    d = grad_flat.numel()
+
+    def generator():
+        for idx in range(q):
+            start_time = time.time()
+
+            # 生成随机向量
+            noise_flat = torch.randn(d)
+
+            # 构造低秩映射 R
+            # 我们用一个小型旋转矩阵作为R
+            r = min(64, d)  # 可调低秩大小
+            R = torch.randn(r, r)
+
+            # 将噪声映射到低秩空间
+            if r < d:
+                # 取前r维作为低秩空间
+                N_low = noise_flat[:r]
+            else:
+                N_low = noise_flat
+
+            mapped_noise = torch.zeros_like(grad_flat)
+            mapped_noise[:r] = N_low @ R  # 映射
+            mapped_noise = mapped_noise / (mapped_noise.norm() + eps)
+
+            # 构造最终方向
+            direction_flat = cosine_target * grad_flat / (grad_flat.norm() + eps) + orth_scale * mapped_noise * total_norm
+
+            # 计算实际余弦相似度
+            actual_cosine_sim = torch.dot(direction_flat, grad_flat) / ((direction_flat.norm() + eps) * total_norm)
+
+            # 反展开成梯度列表的形状
+            direction = []
+            start = 0
+            for g in bp_grads:
+                sz = g.numel()
+                direction.append(direction_flat[start:start+sz].view_as(g))
+                start += sz
+
+            elapsed = time.time() - start_time
+            print(f"[Instruct] Perturbation {idx+1}/{q}: "
+                  f"R.shape={R.shape}, cosine_similarity={actual_cosine_sim.item():.6f}, "
+                  f"time={elapsed:.4f}s")
+
+            yield direction
+
+    return generator()
+
+def generate_instruct_directions_blocked(bp_grads, q, cosine_target, total_norm, device=None, block_size=16384, rank_per_block=8):
+    """
+    分块生成与BP梯度保持给定余弦相似度的扰动方向（GPU优化版本）
+    
+    Args:
+        bp_grads: list of tensors (梯度)
+        q: 生成次数
+        cosine_target: 目标余弦相似度
+        total_norm: bp_grads总L2范数
+        device: 设备 ('cuda' 或 'cpu')，如果为None则从bp_grads推断
+        block_size: 每块的大小（默认16384，增大以减少块数）
+        rank_per_block: 每块的低秩映射维度（默认8，减小R的大小）
+    
+    Returns:
+        generator: 生成方向向量的迭代器
+    """
+    if not bp_grads or q <= 0:
+        return None
+
+    # 自动推断device
+    if device is None:
+        device = bp_grads[0].device if hasattr(bp_grads[0], 'device') else torch.device('cpu')
+    
+    eps = 1e-12
+    cosine_target = max(min(float(cosine_target), 0.9999), -0.9999)
+    orth_scale = math.sqrt(max(0.0, 1.0 - cosine_target ** 2))
+
+    # 展平梯度并移到GPU
+    grad_flat = torch.cat([g.flatten().to(device) for g in bp_grads])
+    d = int(grad_flat.numel())
+    block_size = int(block_size)
+    num_blocks = math.ceil(d / block_size)
+    
+    # 预计算归一化梯度（避免重复计算）
+    grad_norm = grad_flat.norm() + eps
+    grad_normalized = grad_flat / grad_norm
+
+    def generator():
+        for idx in range(q):
+            start_time = time.time()
+
+            # 初始化总噪声向量（在GPU上）
+            total_noise = torch.zeros(d, device=device, dtype=grad_flat.dtype)
+            total_R_size = 0
+
+            # 分块生成（使用更小的rank以减少R的大小）
+            for b in range(num_blocks):
+                start = b * block_size
+                end = min((b+1)*block_size, d)
+                size = end - start
+
+                # 当前块的rank（减小以降低R的大小）
+                r = min(rank_per_block, size)
+                
+                # 生成块噪声（直接在GPU上）
+                noise_block = torch.randn(size, device=device, dtype=grad_flat.dtype)
+
+                # 小低秩矩阵 R（使用更小的rank）
+                R = torch.randn(r, r, device=device, dtype=grad_flat.dtype)
+                
+                # 使用前r维进行映射（内存友好）
+                noise_low = noise_block[:r]
+                mapped_low = noise_low @ R
+                
+                # 创建映射后的块噪声
+                mapped_noise_block = torch.zeros(size, device=device, dtype=grad_flat.dtype)
+                mapped_noise_block[:r] = mapped_low
+                
+                # 如果size > r，剩余部分使用原始噪声（保持随机性）
+                if size > r:
+                    mapped_noise_block[r:] = noise_block[r:]
+
+                # 归一化块噪声
+                block_norm = mapped_noise_block.norm() + eps
+                mapped_noise_block = mapped_noise_block / block_norm
+
+                # 累加到总噪声
+                total_noise[start:end] = mapped_noise_block
+                total_R_size += R.numel()
+
+            # 归一化总噪声
+            total_noise_norm = total_noise.norm() + eps
+            total_noise = total_noise / total_noise_norm
+
+            # 构造最终方向（使用预计算的归一化梯度）
+            direction_flat = cosine_target * grad_normalized * total_norm + orth_scale * total_norm * total_noise
+
+            # 实际余弦相似度（优化计算）
+            direction_norm = direction_flat.norm() + eps
+            actual_cosine_sim = torch.dot(direction_flat, grad_flat) / (direction_norm * total_norm)
+
+            # 展开回原形状（延迟移到CPU，如果需要的话）
+            direction = []
+            start = 0
+            for g in bp_grads:
+                sz = g.numel()
+                dir_tensor = direction_flat[start:start+sz].view_as(g)
+                # 如果原始梯度在CPU，则移回CPU
+                if g.device != device:
+                    dir_tensor = dir_tensor.to(g.device)
+                direction.append(dir_tensor)
+                start += sz
+
+            elapsed = time.time() - start_time
+            # 在第一个和最后一个idx打印，确保及时输出
+            should_print = (idx == 0) or (idx == q - 1) or ((idx + 1) % max(1, q // 4) == 0)
+            if should_print:
+                total_R_size_mb = total_R_size * 4 / (1024 * 1024)  # 假设float32，4字节/元素
+                print(f"[Block Instruct] Perturbation {idx+1}/{q}: "
+                      f"total_R_size={total_R_size} ({total_R_size_mb:.2f}MB, rank={rank_per_block}, blocks={num_blocks}), "
+                      f"cosine_similarity={actual_cosine_sim.item():.6f}, "
+                      f"time={elapsed:.4f}s, device={device}", flush=True)
+
+            yield direction
+
+    return generator()
+
 def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_norm_sq):
     """生成与BP梯度方向保持给定余弦相似度的方向迭代器。"""
     if not bp_grads or q is None or q <= 0:
@@ -805,12 +984,12 @@ def train(
                         total_norm_sq += float(torch.sum(g * g).item())
                     total_norm = math.sqrt(total_norm_sq)
                     if total_norm > 0.0:
-                        manual_dirs = generate_instruct_directions(
+                        manual_dirs = generate_instruct_directions_blocked(
                             bp_grads,
                             q,
                             INSTRUCT_COSINE_TARGET,
                             total_norm,
-                            total_norm_sq,
+                            device=device,
                         )
                     if manual_dirs is None and total_norm is not None and total_norm > 0.0:
                         manual_dirs = ([g / total_norm for g in bp_grads],)

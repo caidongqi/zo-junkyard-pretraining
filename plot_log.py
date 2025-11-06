@@ -60,7 +60,7 @@ def downsample_series(values: List[float], max_points: Optional[int]) -> Tuple[L
 
 
 def iter_log_files(root: Path) -> Iterable[Path]:
-    for job_dir in sorted(root.glob("job_logs_*")):
+    for job_dir in sorted(root.glob("job_logs*")):
         if not job_dir.is_dir():
             continue
         for log_file in sorted(job_dir.glob("*.log")):
