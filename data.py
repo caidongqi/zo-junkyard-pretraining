@@ -39,10 +39,50 @@ DATASET_CONFIGS = {
         'split': 'train',
         'text_field': 'text',
         'streaming': True,
-        'description': 'Cosmopedia完整版，30M+样本，高质量合成教育数据',
+        'description': 'Cosmopedia完整版，30M+样本，高质量合成教育数据（web_samples_v2）',
         'recommended_samples': 100000,
         'language': 'en',
         'size': '~30M documents',
+        'dataset_name': 'web_samples_v2',  # 默认使用web_samples_v2子集
+    },
+    
+    # Cosmopedia - Stories: 故事子集
+    'cosmopedia-stories': {
+        'hf_path': 'HuggingFaceTB/cosmopedia',
+        'split': 'train',
+        'text_field': 'text',
+        'streaming': True,
+        'description': 'Cosmopedia stories子集，故事数据',
+        'recommended_samples': 50000,
+        'language': 'en',
+        'size': '~3M documents',
+        'dataset_name': 'stories',
+    },
+    
+    # Cosmopedia - KhanAcademy: Khan Academy教育内容
+    'cosmopedia-khanacademy': {
+        'hf_path': 'HuggingFaceTB/cosmopedia',
+        'split': 'train',
+        'text_field': 'text',
+        'streaming': True,
+        'description': 'Cosmopedia KhanAcademy子集，高质量教育内容',
+        'recommended_samples': 50000,
+        'language': 'en',
+        'size': '~2M documents',
+        'dataset_name': 'khanacademy',
+    },
+    
+    # Cosmopedia - OpenStax: OpenStax教科书内容
+    'cosmopedia-openstax': {
+        'hf_path': 'HuggingFaceTB/cosmopedia',
+        'split': 'train',
+        'text_field': 'text',
+        'streaming': True,
+        'description': 'Cosmopedia OpenStax子集，教科书内容',
+        'recommended_samples': 30000,
+        'language': 'en',
+        'size': '~1M documents',
+        'dataset_name': 'openstax',
     },
     
     # WikiText-103: 维基百科文本
