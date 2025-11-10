@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import math
 import re
+from collections import deque
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -38,6 +39,25 @@ def extract_losses_from_log(path: Path) -> List[float]:
                 except ValueError:
                     continue
     return losses
+
+
+def smooth_series(values: List[float], window: int) -> List[float]:
+    if window is None or window <= 1 or not values:
+        return values[:]
+
+    window = min(window, len(values))
+    acc = 0.0
+    rolling: deque[float] = deque()
+    smoothed: List[float] = []
+
+    for value in values:
+        rolling.append(value)
+        acc += value
+        if len(rolling) > window:
+            acc -= rolling.popleft()
+        smoothed.append(acc / len(rolling))
+
+    return smoothed
 
 
 def downsample_series(values: List[float], max_points: Optional[int]) -> Tuple[List[int], List[float]]:
@@ -68,13 +88,18 @@ def iter_log_files(root: Path) -> Iterable[Path]:
                 yield log_file
 
 
-def load_all_losses(root: Path, max_points: Optional[int]) -> Dict[str, Tuple[List[int], List[float]]]:
+def load_all_losses(
+    root: Path,
+    max_points: Optional[int],
+    smooth_window: Optional[int],
+) -> Dict[str, Tuple[List[int], List[float]]]:
     series: Dict[str, Tuple[List[int], List[float]]] = {}
     for log_file in iter_log_files(root):
         losses = extract_losses_from_log(log_file)
         if not losses:
             continue
-        steps, downsampled = downsample_series(losses, max_points)
+        smoothed = smooth_series(losses, smooth_window)
+        steps, downsampled = downsample_series(smoothed, max_points)
         series[log_file.stem] = (steps, downsampled)
     return series
 
@@ -127,6 +152,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum points per series after downsampling (default: 500).",
     )
     parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=0,
+        help="Apply a trailing moving-average with this window size (default: 0 = disabled).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -141,10 +172,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# python plot_log.py --log-root /data/cdq/current_project/zo-test-cdq/log_data/ --output plots/log_plot.png
+# python plot_log.py --output plots/log_plot.png --smooth-window 20 --log-root /data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251106_131617
 def main() -> None:
     args = parse_args()
-    series = load_all_losses(args.log_root, args.max_points)
+    series = load_all_losses(args.log_root, args.max_points, args.smooth_window)
     plot_series(series, args.output, args.title)
 
 

@@ -208,6 +208,7 @@ DATASET_CONFIGS = {
 # 数据加载函数
 # ============================================================================
 
+#TODO: 加上shuffle seeds，保证Instruct 模式下FO gradient的数据和ZO的不一样
 def get_dataloader(
     tokenizer,
     dataset_name='cosmopedia-100k',

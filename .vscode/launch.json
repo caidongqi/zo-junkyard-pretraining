@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Python: reproduce_zo_paper.py (Instruct)",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "/data/cdq/current_project/zo-test-cdq/reproduce_zo_paper.py",
+        "cwd": "/data/cdq/current_project/zo-test-cdq",
+        "console": "integratedTerminal",
+        "justMyCode": true,
+        "args": [
+          "--mode", "Instruct",
+          "--scope", "full",
+          "--query_budget_q", "64",
+          "--bp_interval", "1",
+          "--dataset", "fineweb-edu-10bt",
+          "--max_samples", "10000",
+          "--bp_dataset", "cosmopedia-100k",
+          "--bp_max_samples", "5000",
+          "--learning_rate", "1e-3",
+          "--optimizer", "mudamw",
+          "--epochs", "5",
+          "--batch_size", "2"
+        ],
+        "env": {},
+        "envFile": "${workspaceFolder}/.env"
+      }
+    ]
+  }

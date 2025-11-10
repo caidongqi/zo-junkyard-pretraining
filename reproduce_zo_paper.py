@@ -24,7 +24,8 @@ from data import get_dataloader
 
 # --- 常量配置 (Constants) ---
 
-INSTRUCT_COSINE_TARGET = 0.9
+DEFAULT_INSTRUCT_COSINE_TARGET = 0.9
+DEFAULT_INSTRUCT_NOISE_SCALE = 0.5
 
 # --- 1. 配置与模型定义 (Configuration and Model Definition) ---
 # 注意: create_model 函数现在从 model.py 导入
@@ -100,6 +101,10 @@ def zo_gradient_estimator(
         if batch_labels.device != device:
             batch_labels = batch_labels.to(device)
         return batch_inputs, batch_labels
+
+    # 计算原始参数位置的loss（用于记录）
+    batch_inputs, batch_labels = get_batch()
+    base_loss = compute_loss(batch_inputs, batch_labels)
 
     grads = [torch.zeros_like(p.data) for p in trainable_params]
     used_directions = 0
@@ -192,7 +197,7 @@ def zo_gradient_estimator(
     if was_training:
         model.train()
 
-    return grads
+    return grads, base_loss
 
 
 def save_latest_checkpoint(
@@ -253,186 +258,390 @@ def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
     return loss.detach(), grads
 
 
-def generate_instruct_directions_with_R(bp_grads, q, cosine_target, total_norm, total_norm_sq):
-    """生成与BP梯度方向保持给定余弦相似度的方向迭代器，使用低秩映射R。"""
+def generate_instruct_directions_with_R(bp_grads, q, cosine_target, total_norm, total_norm_sq=None, device=None):
+    """生成基于低秩投影R的方向，使其与BP梯度具有较高余弦相似度。"""
     if not bp_grads or q is None or q <= 0:
         return None
     if total_norm <= 1e-12:
         return None
 
+    if device is None:
+        device = bp_grads[0].device if hasattr(bp_grads[0], 'device') else torch.device('cpu')
+
     cosine_target = float(cosine_target)
     cosine_target = max(min(cosine_target, 0.9999), -0.9999)
-    orth_scale = math.sqrt(max(0.0, 1.0 - cosine_target ** 2))
+    target_sign = -1.0 if cosine_target < 0.0 else 1.0
+
+    min_similarity = max(abs(cosine_target), 0.9)
+    min_similarity = min(min_similarity, 0.9999)
     eps = 1e-12
 
-    # 将梯度列表展平成一个长向量
-    grad_flat = torch.cat([g.flatten() for g in bp_grads])
+    grad_flat = torch.cat([g.flatten().to(device) for g in bp_grads])
     d = grad_flat.numel()
+    total_norm_sq = float(torch.sum(grad_flat * grad_flat).item())
+    if total_norm_sq <= eps:
+        return None
+
+    energy_threshold = min_similarity ** 2 * total_norm_sq
+
+    abs_sq = grad_flat.abs().pow(2)
+    initial_rank = min(64, d)
+    k = max(1, initial_rank)
+
+    while True:
+        values, indices = torch.topk(abs_sq, k, largest=True)
+        captured_energy = float(values.sum().item())
+        if captured_energy >= energy_threshold or k >= d:
+            break
+        previous_k = k
+        k = min(k * 2, d)
+        if k == previous_k:
+            break
+
+    cumsum_values = torch.cumsum(values, dim=0)
+    if energy_threshold <= float(cumsum_values[-1].item()):
+        effective_rank_idx = torch.searchsorted(cumsum_values, torch.tensor(energy_threshold, device=cumsum_values.device))
+        effective_rank = int(effective_rank_idx.item()) + 1
+    else:
+        effective_rank = int(values.numel())
+
+    effective_rank = max(1, min(effective_rank, values.numel()))
+    # 候选索引池：使用更大的集合以支持随机采样多样性
+    candidate_pool_size = min(max(effective_rank * 2, 128), k)
+    candidate_indices = indices[:candidate_pool_size]
 
     def generator():
+        total_start_time = time.time()
+        total_cosine_sim = 0.0
+        total_rank = 0
+        
         for idx in range(q):
-            start_time = time.time()
+            iter_start_time = time.time()
 
-            # 生成随机向量
-            noise_flat = torch.randn(d)
+            # 每次随机选择不同的索引集合
+            # 从候选池中随机采样，确保能量满足阈值
+            max_selected = min(candidate_pool_size, effective_rank * 2)
+            
+            # 尝试不同的采样策略：随机选择索引
+            num_selected = effective_rank
+            for attempt in range(10):  # 最多尝试10次
+                # 随机打乱候选索引并选择前num_selected个
+                perm = torch.randperm(candidate_pool_size, device=device)
+                selected_from_pool = perm[:num_selected]
+                selected_indices = candidate_indices[selected_from_pool]
+                
+                # 检查能量是否满足阈值
+                selected_abs_sq = abs_sq[selected_indices]
+                captured_energy = float(selected_abs_sq.sum().item())
+                
+                if captured_energy >= energy_threshold:
+                    break
+                # 如果能量不够，增加选择的索引数量
+                num_selected = min(num_selected + max(1, effective_rank // 4), max_selected)
+            
+            # 如果还是不够，使用top-k策略作为fallback
+            if captured_energy < energy_threshold:
+                selected_indices = indices[:effective_rank]
 
-            # 构造低秩映射 R
-            # 我们用一个小型旋转矩阵作为R
-            r = min(64, d)  # 可调低秩大小
-            R = torch.randn(r, r)
+            # 基于选中的索引生成方向
+            projection_flat = torch.zeros_like(grad_flat)
+            projection_flat[selected_indices] = grad_flat[selected_indices]
 
-            # 将噪声映射到低秩空间
-            if r < d:
-                # 取前r维作为低秩空间
-                N_low = noise_flat[:r]
+            proj_norm = projection_flat.norm() + eps
+            if proj_norm <= eps:
+                projection_flat = grad_flat.clone()
             else:
-                N_low = noise_flat
+                projection_flat = projection_flat * (total_norm / proj_norm)
+            projection_flat = projection_flat * target_sign
 
-            mapped_noise = torch.zeros_like(grad_flat)
-            mapped_noise[:r] = N_low @ R  # 映射
-            mapped_noise = mapped_noise / (mapped_noise.norm() + eps)
+            direction_flat = projection_flat
+            direction_norm = direction_flat.norm() + eps
+            actual_cosine_sim = torch.dot(direction_flat, grad_flat) / (direction_norm * total_norm)
 
-            # 构造最终方向
-            direction_flat = cosine_target * grad_flat / (grad_flat.norm() + eps) + orth_scale * mapped_noise * total_norm
+            # 累积统计信息
+            total_cosine_sim += actual_cosine_sim.item()
+            total_rank += len(selected_indices)
 
-            # 计算实际余弦相似度
-            actual_cosine_sim = torch.dot(direction_flat, grad_flat) / ((direction_flat.norm() + eps) * total_norm)
-
-            # 反展开成梯度列表的形状
             direction = []
             start = 0
             for g in bp_grads:
                 sz = g.numel()
-                direction.append(direction_flat[start:start+sz].view_as(g))
+                out = direction_flat[start:start+sz].view_as(g)
+                if out.device != g.device:
+                    out = out.to(g.device)
+                direction.append(out)
                 start += sz
 
-            elapsed = time.time() - start_time
-            print(f"[Instruct] Perturbation {idx+1}/{q}: "
-                  f"R.shape={R.shape}, cosine_similarity={actual_cosine_sim.item():.6f}, "
-                  f"time={elapsed:.4f}s")
+            # 在最后一次迭代时打印汇总（放在 yield 之前，避免消费者停止后汇总丢失）
+            if idx == q - 1:
+                total_elapsed = time.time() - total_start_time
+                avg_cosine_sim = total_cosine_sim / q
+                avg_rank = total_rank / q
+                print(
+                    f"[Instruct] Summary: avg_rank={avg_rank:.1f}, avg_cosine_similarity={avg_cosine_sim:.6f}, "
+                    f"total_time={total_elapsed:.4f}s",
+                    flush=True,
+                )
 
             yield direction
 
     return generator()
 
-def generate_instruct_directions_blocked(bp_grads, q, cosine_target, total_norm, device=None, block_size=16384, rank_per_block=8):
-    """
-    分块生成与BP梯度保持给定余弦相似度的扰动方向（GPU优化版本）
-    
-    Args:
-        bp_grads: list of tensors (梯度)
-        q: 生成次数
-        cosine_target: 目标余弦相似度
-        total_norm: bp_grads总L2范数
-        device: 设备 ('cuda' 或 'cpu')，如果为None则从bp_grads推断
-        block_size: 每块的大小（默认16384，增大以减少块数）
-        rank_per_block: 每块的低秩映射维度（默认8，减小R的大小）
-    
-    Returns:
-        generator: 生成方向向量的迭代器
-    """
+
+def generate_instruct_directions_hybrid(
+    bp_grads,
+    q,
+    cosine_target,
+    noise_scale,
+    device=None,
+):
+    """Generate hybrid directions that preserve high-energy gradient components and add noise elsewhere."""
+    if not bp_grads or q is None or q <= 0:
+        return None
+
+    sample_grad = bp_grads[0]
+    if device is None:
+        device = sample_grad.device if hasattr(sample_grad, "device") else torch.device("cpu")
+    dtype = sample_grad.dtype if hasattr(sample_grad, "dtype") else torch.float32
+
+    grad_flat = torch.cat([g.flatten().to(device=device, dtype=dtype) for g in bp_grads])
+    d = int(grad_flat.numel())
+    if d == 0:
+        return None
+
+    total_norm = torch.norm(grad_flat)
+    if total_norm <= 1e-12:
+        return None
+    total_norm_sq = total_norm * total_norm
+
+    cosine_target = float(cosine_target)
+    noise_scale = float(noise_scale)
+    min_similarity = max(min(abs(cosine_target), 0.9999), 0.9)
+    energy_threshold = float(min_similarity ** 2 * total_norm_sq)
+
+    abs_sq = grad_flat.abs().pow(2)
+    k = min(64, d)
+    while True:
+        values, indices = torch.topk(abs_sq, k, largest=True)
+        captured_energy = float(values.sum().item())
+        if captured_energy >= energy_threshold or k >= d:
+            break
+        next_k = min(k * 2, d)
+        if next_k == k:
+            break
+        k = next_k
+
+    threshold_tensor = torch.tensor(energy_threshold, device=values.device, dtype=values.dtype)
+    cumsum_values = torch.cumsum(values, dim=0)
+    effective_rank_idx = torch.searchsorted(cumsum_values, threshold_tensor)
+    effective_rank = int(effective_rank_idx.item()) + 1
+    effective_rank = max(1, min(effective_rank, values.numel()))
+
+    high_energy_indices = indices[:effective_rank]
+
+    def generator():
+        total_cosine = 0.0
+        start_time = time.time()
+
+        for direction_idx in range(int(q)):
+            hybrid_flat = torch.zeros_like(grad_flat)
+            hybrid_flat[high_energy_indices] = grad_flat[high_energy_indices]
+
+            low_energy_mask = torch.ones(grad_flat.shape, dtype=torch.bool, device=device)
+            low_energy_mask[high_energy_indices] = False
+            num_low_energy_dims = int(low_energy_mask.sum().item())
+
+            if num_low_energy_dims > 0 and noise_scale > 0.0:
+                noise_magnitude = noise_scale * (total_norm / (d ** 0.5))
+                noise = torch.randn(num_low_energy_dims, device=device, dtype=dtype) * noise_magnitude
+                hybrid_flat[low_energy_mask] = noise
+
+            hybrid_norm = torch.norm(hybrid_flat)
+            if hybrid_norm <= 1e-12:
+                final_similarity = 0.0
+            else:
+                final_similarity = float(torch.dot(hybrid_flat, grad_flat) / (hybrid_norm * total_norm))
+            total_cosine += final_similarity
+
+            print("-" * 60)
+            print(
+                f"[Instruct-Hybrid] direction #{direction_idx + 1}: "
+                f"d={d}, effective_rank={effective_rank} ({effective_rank / d:.2%} of total)"
+            )
+            print(f"  cosine_target={cosine_target}")
+            print(f"  noise_scale={noise_scale}")
+            print(f"  actual_cosine_similarity={final_similarity:.6f}")
+            print("-" * 60)
+
+            direction = []
+            start = 0
+            for grad in bp_grads:
+                size = grad.numel()
+                chunk = hybrid_flat[start:start + size].view_as(grad)
+                if chunk.device != grad.device or chunk.dtype != grad.dtype:
+                    chunk = chunk.to(device=grad.device, dtype=grad.dtype)
+                direction.append(chunk)
+                start += size
+
+            if direction_idx == int(q) - 1:
+                elapsed = time.time() - start_time
+                average_cosine = total_cosine / max(1, int(q))
+                print(
+                    f"[Instruct-Hybrid] Summary: avg_cosine_similarity={average_cosine:.6f}, "
+                    f"effective_rank={effective_rank}, "
+                    f"total_time={elapsed:.4f}s",
+                    flush=True,
+                )
+
+            yield direction
+
+    return generator()
+
+def generate_instruct_directions_blocked(
+    bp_grads,
+    q,
+    cosine_target,
+    total_norm,
+    device=None,
+    block_size=16384,
+    rank_per_block=8,
+    use_half_noise=True,
+):
+    """分块设置下基于低秩R投影生成高相似度的BP方向。"""
+    del use_half_noise
+
     if not bp_grads or q <= 0:
         return None
 
-    # 自动推断device
     if device is None:
         device = bp_grads[0].device if hasattr(bp_grads[0], 'device') else torch.device('cpu')
-    
+
     eps = 1e-12
     cosine_target = max(min(float(cosine_target), 0.9999), -0.9999)
-    orth_scale = math.sqrt(max(0.0, 1.0 - cosine_target ** 2))
+    target_sign = -1.0 if cosine_target < 0.0 else 1.0
 
-    # 展平梯度并移到GPU
+    min_similarity = max(abs(cosine_target), 0.9)
+    min_similarity = min(min_similarity, 0.9999)
+
     grad_flat = torch.cat([g.flatten().to(device) for g in bp_grads])
     d = int(grad_flat.numel())
-    block_size = int(block_size)
-    num_blocks = math.ceil(d / block_size)
-    
-    # 预计算归一化梯度（避免重复计算）
-    grad_norm = grad_flat.norm() + eps
-    grad_normalized = grad_flat / grad_norm
+    if d == 0:
+        return None
+
+    total_norm_sq = float(torch.sum(grad_flat * grad_flat).item())
+    if total_norm_sq <= eps:
+        return None
+
+    energy_threshold = min_similarity ** 2 * total_norm_sq
+
+    abs_sq = grad_flat.abs().pow(2)
+    block_size = max(int(block_size), 1)
+    num_blocks = max(1, math.ceil(d / block_size))
+    max_rank_cap = min(max(rank_per_block * num_blocks, 1), d)
+    initial_rank = min(max(rank_per_block, 1), d)
+    k = max(1, initial_rank)
+
+    while True:
+        values, indices = torch.topk(abs_sq, k, largest=True)
+        captured_energy = float(values.sum().item())
+        if captured_energy >= energy_threshold or k >= max_rank_cap:
+            break
+        next_k = min(k * 2, max_rank_cap)
+        if next_k == k:
+            break
+        k = next_k
+
+    if energy_threshold <= float(values.sum().item()):
+        cumsum_values = torch.cumsum(values, dim=0)
+        searched = torch.searchsorted(cumsum_values, torch.tensor(energy_threshold, device=cumsum_values.device))
+        effective_rank = int(searched.item()) + 1
+    else:
+        effective_rank = int(values.numel())
+
+    effective_rank = max(1, min(effective_rank, values.numel()))
+    # 候选索引池：使用更大的集合以支持随机采样多样性
+    candidate_pool_size = min(max(effective_rank * 2, 128), k)
+    candidate_indices = indices[:candidate_pool_size]
 
     def generator():
+        total_start_time = time.time()
+        total_cosine_sim = 0.0
+        total_rank = 0
+        
         for idx in range(q):
-            start_time = time.time()
+            iter_start_time = time.time()
 
-            # 初始化总噪声向量（在GPU上）
-            total_noise = torch.zeros(d, device=device, dtype=grad_flat.dtype)
-            total_R_size = 0
-
-            # 分块生成（使用更小的rank以减少R的大小）
-            for b in range(num_blocks):
-                start = b * block_size
-                end = min((b+1)*block_size, d)
-                size = end - start
-
-                # 当前块的rank（减小以降低R的大小）
-                r = min(rank_per_block, size)
+            # 每次随机选择不同的索引集合
+            # 从候选池中随机采样，确保能量满足阈值
+            max_selected = min(candidate_pool_size, effective_rank * 2)
+            
+            # 尝试不同的采样策略：随机选择索引
+            num_selected = effective_rank
+            captured_energy = 0.0
+            for attempt in range(10):  # 最多尝试10次
+                # 随机打乱候选索引并选择前num_selected个
+                perm = torch.randperm(candidate_pool_size, device=device)
+                selected_from_pool = perm[:num_selected]
+                selected_indices = candidate_indices[selected_from_pool]
                 
-                # 生成块噪声（直接在GPU上）
-                noise_block = torch.randn(size, device=device, dtype=grad_flat.dtype)
-
-                # 小低秩矩阵 R（使用更小的rank）
-                R = torch.randn(r, r, device=device, dtype=grad_flat.dtype)
+                # 检查能量是否满足阈值
+                selected_abs_sq = abs_sq[selected_indices]
+                captured_energy = float(selected_abs_sq.sum().item())
                 
-                # 使用前r维进行映射（内存友好）
-                noise_low = noise_block[:r]
-                mapped_low = noise_low @ R
-                
-                # 创建映射后的块噪声
-                mapped_noise_block = torch.zeros(size, device=device, dtype=grad_flat.dtype)
-                mapped_noise_block[:r] = mapped_low
-                
-                # 如果size > r，剩余部分使用原始噪声（保持随机性）
-                if size > r:
-                    mapped_noise_block[r:] = noise_block[r:]
+                if captured_energy >= energy_threshold:
+                    break
+                # 如果能量不够，增加选择的索引数量
+                num_selected = min(num_selected + max(1, effective_rank // 4), max_selected)
+            
+            # 如果还是不够，使用top-k策略作为fallback
+            if captured_energy < energy_threshold:
+                selected_indices = indices[:effective_rank]
 
-                # 归一化块噪声
-                block_norm = mapped_noise_block.norm() + eps
-                mapped_noise_block = mapped_noise_block / block_norm
+            # 基于选中的索引生成方向
+            projection_flat = torch.zeros_like(grad_flat)
+            projection_flat[selected_indices] = grad_flat[selected_indices]
 
-                # 累加到总噪声
-                total_noise[start:end] = mapped_noise_block
-                total_R_size += R.numel()
+            proj_norm = projection_flat.norm() + eps
+            if proj_norm <= eps:
+                projection_flat = grad_flat.clone()
+            else:
+                projection_flat = projection_flat * (total_norm / proj_norm)
+            projection_flat = projection_flat * target_sign
 
-            # 归一化总噪声
-            total_noise_norm = total_noise.norm() + eps
-            total_noise = total_noise / total_noise_norm
-
-            # 构造最终方向（使用预计算的归一化梯度）
-            direction_flat = cosine_target * grad_normalized * total_norm + orth_scale * total_norm * total_noise
-
-            # 实际余弦相似度（优化计算）
+            direction_flat = projection_flat
             direction_norm = direction_flat.norm() + eps
             actual_cosine_sim = torch.dot(direction_flat, grad_flat) / (direction_norm * total_norm)
 
-            # 展开回原形状（延迟移到CPU，如果需要的话）
+            # 累积统计信息
+            total_cosine_sim += actual_cosine_sim.item()
+            total_rank += len(selected_indices)
+
             direction = []
             start = 0
             for g in bp_grads:
                 sz = g.numel()
                 dir_tensor = direction_flat[start:start+sz].view_as(g)
-                # 如果原始梯度在CPU，则移回CPU
                 if g.device != device:
                     dir_tensor = dir_tensor.to(g.device)
                 direction.append(dir_tensor)
                 start += sz
 
-            elapsed = time.time() - start_time
-            # 在第一个和最后一个idx打印，确保及时输出
-            should_print = (idx == 0) or (idx == q - 1) or ((idx + 1) % max(1, q // 4) == 0)
-            if should_print:
-                total_R_size_mb = total_R_size * 4 / (1024 * 1024)  # 假设float32，4字节/元素
-                print(f"[Block Instruct] Perturbation {idx+1}/{q}: "
-                      f"total_R_size={total_R_size} ({total_R_size_mb:.2f}MB, rank={rank_per_block}, blocks={num_blocks}), "
-                      f"cosine_similarity={actual_cosine_sim.item():.6f}, "
-                      f"time={elapsed:.4f}s, device={device}", flush=True)
+            # 在最后一次迭代时打印汇总（放在 yield 之前，避免消费者停止后汇总丢失）
+            if idx == q - 1:
+                total_elapsed = time.time() - total_start_time
+                avg_cosine_sim = total_cosine_sim / q
+                avg_rank = total_rank / q
+                print(
+                    f"[Block Instruct] Summary: avg_rank={avg_rank:.1f}, avg_cosine_similarity={avg_cosine_sim:.6f}, "
+                    f"total_time={total_elapsed:.4f}s, device={device}",
+                    flush=True,
+                )
 
             yield direction
 
     return generator()
 
-def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_norm_sq):
+def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_norm_sq, device):
     """生成与BP梯度方向保持给定余弦相似度的方向迭代器。"""
     if not bp_grads or q is None or q <= 0:
         return None
@@ -445,50 +654,81 @@ def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_n
     orth_scale = math.sqrt(max(0.0, 1.0 - cosine_target ** 2))
     eps = 1e-12
 
+    # 将 total_norm_sq 转换为 GPU tensor
+    total_norm_sq_tensor = torch.tensor(total_norm_sq, device=device, dtype=torch.float32)
+    total_norm_tensor = torch.tensor(total_norm, device=device, dtype=torch.float32)
+    eps_tensor = torch.tensor(eps, device=device, dtype=torch.float32)
+
     def generator():
+        total_start_time = time.time()
+        total_cosine_sim = 0.0
+        
         for idx in range(q):
             noises = None
             for _attempt in range(6):
-                noises = [torch.randn_like(g) for g in bp_grads]
-                dot = 0.0
+                # 在 GPU 上生成随机噪声
+                noises = [torch.randn_like(g, device=device) for g in bp_grads]
+                
+                # GPU 上计算点积
+                dot = torch.tensor(0.0, device=device)
                 for noise, grad in zip(noises, bp_grads):
-                    dot += float(torch.sum(noise * grad).item())
-                proj_coeff = dot / (total_norm_sq + eps)
+                    dot += torch.sum(noise * grad)
+                
+                # GPU 上计算投影系数
+                proj_coeff = dot / (total_norm_sq_tensor + eps_tensor)
+                
+                # GPU 上进行正交化
                 for i in range(len(noises)):
                     noises[i] = noises[i] - proj_coeff * bp_grads[i]
 
-                noise_norm_sq = 0.0
+                # GPU 上计算噪声范数
+                noise_norm_sq = torch.tensor(0.0, device=device)
                 for noise in noises:
-                    noise_norm_sq += float(torch.sum(noise * noise).item())
+                    noise_norm_sq += torch.sum(noise * noise)
 
                 if noise_norm_sq > eps:
-                    noise_norm = math.sqrt(noise_norm_sq)
+                    noise_norm = torch.sqrt(noise_norm_sq)
                     for i in range(len(noises)):
-                        noises[i] = noises[i] / (noise_norm + eps)
+                        noises[i] = noises[i] / (noise_norm + eps_tensor)
                     break
             else:
-                noises = [torch.randn_like(g) for g in bp_grads]
-                noise_norm_sq = sum(float(torch.sum(n * n).item()) for n in noises) + eps
-                noise_norm = math.sqrt(noise_norm_sq)
+                # 失败后的处理
+                noises = [torch.randn_like(g, device=device) for g in bp_grads]
+                noise_norm_sq = torch.tensor(0.0, device=device)
+                for n in noises:
+                    noise_norm_sq += torch.sum(n * n)
+                noise_norm = torch.sqrt(noise_norm_sq + eps_tensor)
                 for i in range(len(noises)):
-                    noises[i] = noises[i] / (noise_norm + eps)
+                    noises[i] = noises[i] / (noise_norm + eps_tensor)
 
+            # GPU 上生成最终方向
             direction = []
             for grad, noise in zip(bp_grads, noises):
-                dir_tensor = cosine_target * grad + orth_scale * total_norm * noise
+                dir_tensor = cosine_target * grad + orth_scale * total_norm_tensor * noise
                 direction.append(dir_tensor)
             
-            # # 计算实际的余弦相似度并打印日志
-            # dot_product = 0.0
-            # direction_norm_sq = 0.0
-            # for dir_t, grad in zip(direction, bp_grads):
-            #     dot_product += float(torch.sum(dir_t * grad).item())
-            #     direction_norm_sq += float(torch.sum(dir_t * dir_t).item())
+            # 计算实际的余弦相似度
+            dot_product = torch.tensor(0.0, device=device)
+            direction_norm_sq = torch.tensor(0.0, device=device)
+            for dir_t, grad in zip(direction, bp_grads):
+                dot_product += torch.sum(dir_t * grad)
+                direction_norm_sq += torch.sum(dir_t * dir_t)
             
-            # direction_norm = math.sqrt(direction_norm_sq + eps)
-            # actual_cosine_sim = dot_product / (direction_norm * total_norm + eps)
+            direction_norm = torch.sqrt(direction_norm_sq + eps_tensor)
+            actual_cosine_sim = dot_product / (direction_norm * total_norm_tensor + eps_tensor)
             
-            # print(f"[Instruct] Perturbation {idx+1}/{q}: cosine_similarity={actual_cosine_sim:.6f}, target={cosine_target:.6f}")
+            # 累积统计信息
+            total_cosine_sim += actual_cosine_sim.item()
+            
+            # 在最后一次迭代时打印汇总
+            if idx == q - 1:
+                total_elapsed = time.time() - total_start_time
+                avg_cosine_sim = total_cosine_sim / q
+                print(
+                    f"[Instruct-GramSchmidt] Summary: avg_cosine_similarity={avg_cosine_sim:.6f}, "
+                    f"target={cosine_target:.6f}, total_time={total_elapsed:.4f}s, device={device}",
+                    flush=True,
+                )
             
             yield direction
 
@@ -731,6 +971,9 @@ def train(
     run_name=None,
     bp_dataset_name=None,
     bp_max_samples=None,
+    blend_bp_gradient=False,
+    instruct_cosine_target=DEFAULT_INSTRUCT_COSINE_TARGET,
+    instruct_noise_scale=DEFAULT_INSTRUCT_NOISE_SCALE,
 ):
     """主训练函数"""
     
@@ -770,7 +1013,7 @@ def train(
 
     if logger:
         logger.info(
-            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s optimizer=%s bp_interval=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s",
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s optimizer=%s bp_interval=%s blend_bp_gradient=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s",
             run_name or "unnamed",
             mode,
             scope,
@@ -780,6 +1023,9 @@ def train(
             batch_size,
             optimizer_type,
             bp_interval,
+            blend_bp_gradient,
+            instruct_cosine_target,
+            instruct_noise_scale,
             device,
             dataset_name,
             model_size,
@@ -962,39 +1208,30 @@ def train(
                     # 如果有单独的BP数据集，则使用它；否则使用当前训练batch
                     if bp_batch_provider is not None:
                         bp_inputs, bp_labels = bp_batch_provider()
-                        loss, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, bp_inputs, bp_labels)
+                        _, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, bp_inputs, bp_labels)
                     else:
-                        loss, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
-                else:
-                    with torch.no_grad():
-                        current_logits = model(inputs).logits
-                        # Shift logits and labels for next-token prediction
-                        shift_logits = current_logits[..., :-1, :].contiguous()
-                        shift_labels = labels[..., 1:].contiguous()
-                        loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                        _, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
 
                 epsilon = 1e-4  # 增大扰动大小以提高数值稳定性
 
                 manual_dirs = None
-                total_norm_sq = None
-                total_norm = None
                 if mode == 'Instruct' and should_use_bp and bp_grads is not None:
-                    total_norm_sq = 0.0
-                    for g in bp_grads:
-                        total_norm_sq += float(torch.sum(g * g).item())
-                    total_norm = math.sqrt(total_norm_sq)
-                    if total_norm > 0.0:
-                        manual_dirs = generate_instruct_directions_blocked(
-                            bp_grads,
-                            q,
-                            INSTRUCT_COSINE_TARGET,
-                            total_norm,
-                            device=device,
-                        )
-                    if manual_dirs is None and total_norm is not None and total_norm > 0.0:
-                        manual_dirs = ([g / total_norm for g in bp_grads],)
+                    manual_dirs = generate_instruct_directions_hybrid(
+                        bp_grads=bp_grads,
+                        q=q,
+                        cosine_target=instruct_cosine_target,
+                        noise_scale=instruct_noise_scale,
+                        device=device,
+                    )
+                    if manual_dirs is None:
+                        total_norm_sq = 0.0
+                        for g in bp_grads:
+                            total_norm_sq += float(torch.sum(g * g).item())
+                        total_norm = math.sqrt(total_norm_sq)
+                        if total_norm > 0.0:
+                            manual_dirs = ([g / total_norm for g in bp_grads],)
 
-                grad_paramwise = zo_gradient_estimator(
+                grad_paramwise, loss = zo_gradient_estimator(
                     model,
                     trainable_params,
                     loss_fn,
@@ -1007,13 +1244,20 @@ def train(
                     data_provider=query_batch_provider,
                 )
 
-                # TODO: 把这里二者的关系变成一个超参数。
+                # 在Calibrate模式下使用BP梯度
                 if mode == 'Calibrate' and should_use_bp and bp_grads is not None:
                     # grad_paramwise = [
                         # 0.5 * (gz + gb)
                         # for gz, gb in zip(grad_paramwise, bp_grads)
                     # ]
                     grad_paramwise = bp_grads
+                
+                # 在Instruct模式下，可选择混合BP和ZO梯度
+                if mode == 'Instruct' and blend_bp_gradient and should_use_bp and bp_grads is not None:
+                    grad_paramwise = [
+                        0.5 * (gz + gb)
+                        for gz, gb in zip(grad_paramwise, bp_grads)
+                    ]
 
                 grad_norm_sq = 0.0
                 for g in grad_paramwise:
@@ -1100,6 +1344,8 @@ def train(
                         'model_size': model_size,
                         'dataset': dataset_name,
                         'checkpoint_type': 'periodic',
+                        'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
+                        'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
                     }
                     save_latest_checkpoint(
                         model,
@@ -1148,6 +1394,8 @@ def train(
             'model_size': model_size,
             'dataset': dataset_name,
             'checkpoint_type': 'final',
+            'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
+            'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
         }
         save_latest_checkpoint(
             model,
@@ -1203,7 +1451,7 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default=None, help="Optional run name to organize logs and checkpoints.")
     
     # 模型和数据集参数
-    parser.add_argument("--model_size", type=str, default='200M', 
+    parser.add_argument("--model_size", type=str, default='20M', 
                         choices=['20M', '200M', '500M', '1B'],
                         help="Model size: 20M (fast), 200M (GPT-2 Small), 500M (medium), 1B (large).")
     parser.add_argument("--dataset", type=str, default='cosmopedia-100k',
@@ -1223,6 +1471,14 @@ if __name__ == "__main__":
     parser.add_argument("--bp_max_samples", type=int, default=None,
                         help="Maximum number of samples to use from BP dataset. None=use recommended value.")
     
+    # 梯度混合参数（用于Instruct模式）
+    parser.add_argument("--blend_bp_gradient", action="store_true", default=True,
+                        help="In Instruct mode, blend BP gradient with ZO gradient (average of both). Only effective when bp_interval > 0.")
+    parser.add_argument("--instruct_cosine_target", type=float, default=DEFAULT_INSTRUCT_COSINE_TARGET,
+                        help="Target cosine similarity for hybrid instruct direction generation.")
+    parser.add_argument("--instruct_noise_scale", type=float, default=DEFAULT_INSTRUCT_NOISE_SCALE,
+                        help="Noise scale for hybrid instruct direction generation.")
+    
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1233,7 +1489,10 @@ if __name__ == "__main__":
 
     q_str = args.query_budget_q if args.mode in {'ZO', 'Calibrate', 'Instruct'} else 'na'
     bp_str = args.bp_interval if args.mode in {'Calibrate', 'Instruct'} else 'na'
-    default_run_name = f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}"
+    default_run_name = (
+        f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}"
+        f"_bs{args.batch_size}_ct{args.instruct_cosine_target}_ns{args.instruct_noise_scale}"
+    )
     run_name = args.run_name or default_run_name
 
     if args.log_dir:
@@ -1279,7 +1538,10 @@ if __name__ == "__main__":
 
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
-    plot_filename = f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}_bs{args.batch_size}.png"
+    plot_filename = (
+        f"{args.mode}_{args.scope}_q{q_str}_bp{bp_str}_opt{args.optimizer}_lr{args.learning_rate}"
+        f"_bs{args.batch_size}_ct{args.instruct_cosine_target}_ns{args.instruct_noise_scale}.png"
+    )
 
     bp_interval_arg = args.bp_interval if args.bp_interval > 0 else None
 
@@ -1305,6 +1567,9 @@ if __name__ == "__main__":
         run_name=run_name,
         bp_dataset_name=args.bp_dataset,
         bp_max_samples=args.bp_max_samples,
+        blend_bp_gradient=args.blend_bp_gradient,
+        instruct_cosine_target=args.instruct_cosine_target,
+        instruct_noise_scale=args.instruct_noise_scale,
     )
 
     print(f"CSV metrics saved to {csv_file_path}")
