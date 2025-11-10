@@ -21,11 +21,12 @@ PID_FILE=""
 CLEANUP_DONE=false
 
 # 默认配置参数
-MODES=("FO" "Instruct") # 可选: FO, ZO, Calibrate, Instruct
+MODES=("FO") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
 BATCH_SIZES=(32)
+BLOCK_SIZES=(512)  # 序列长度 (可选: 64, 128, 256, 512, 1024)
 QUERY_BUDGETS=(8)
-BP_INTERVALS=(1)
+BP_INTERVALS=(1 2 4 8 16)
 INSTRUCT_COSINE_TARGETS=(0.01)
 INSTRUCT_NOISE_SCALES=(10.0)
 LEARNING_RATES_ZO=(1e-3)
@@ -37,7 +38,7 @@ LOGS_ROOT="logs"
 
 # 模型配置 (Model Configuration)
 # 备选: 20M (超小型，快速实验), 200M (中小型，类似GPT-2 Small), 500M (中型), 1B (大型)
-MODEL_SIZES=("500M")  # 默认使用200M模型，可以是数组如: ("20M" "200M" "500M" "1B")
+MODEL_SIZES=("20M")  # 默认使用200M模型，可以是数组如: ("20M" "200M" "500M" "1B")
 
 # 数据集配置 (Dataset Configuration)
 # 备选数据集:
@@ -68,7 +69,7 @@ BP_MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字
 
 # 并行配置
 MAX_PARALLEL_JOBS=32 # 最大并行任务数
-GPU_IDS="6"           # GPU ID列表，空表示自动检测
+GPU_IDS="0"           # GPU ID列表，空表示自动检测
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -91,6 +92,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --batch-sizes)
             IFS=',' read -ra BATCH_SIZES <<< "$2"
+            shift 2
+            ;;
+        --block-sizes)
+            IFS=',' read -ra BLOCK_SIZES <<< "$2"
             shift 2
             ;;
         --query-budgets)
@@ -153,6 +158,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --modes 'FO,ZO,Calibrate,Instruct'     优化方法 (默认: ZO)"
             echo "  --scopes 'reduced,full' 训练范围 (默认: full)"
             echo "  --batch-sizes '1,2,4' 批次大小 (默认: 2)"
+            echo "  --block-sizes '64,128,256' 序列长度/块大小 (默认: 128)"
             echo "  --query-budgets '1,2,4,8' Query budget (默认: 1,2,4,...,1024)"
             echo "  --bp-intervals '1,2,5,10'  Calibrate/Instruct 模式的BP间隔 (默认: 1,2,5,10)"
             echo "  --learning-rates '1e-3,1e-4' 学习率 (默认: 1e-3)"
@@ -322,42 +328,44 @@ generate_experiments() {
         for mode in "${MODES[@]}"; do
             for scope in "${SCOPES[@]}"; do
                 for batch_size in "${BATCH_SIZES[@]}"; do
-                    for optimizer in "${OPTIMIZERS[@]}"; do
-                        if [ "$mode" = "FO" ]; then
-                            for lr in "${LEARNING_RATES_ZO[@]}"; do
-                                experiments+=("$exp_id:$mode:$scope:$batch_size:N/A:$lr:$optimizer:N/A:$model_size:N/A:N/A")
-                                exp_id=$((exp_id + 1))
-                            done
-                        elif [ "$mode" = "ZO" ]; then
-                            for q in "${QUERY_BUDGETS[@]}"; do
+                    for block_size in "${BLOCK_SIZES[@]}"; do
+                        for optimizer in "${OPTIMIZERS[@]}"; do
+                            if [ "$mode" = "FO" ]; then
                                 for lr in "${LEARNING_RATES_ZO[@]}"; do
-                                    experiments+=("$exp_id:$mode:$scope:$batch_size:$q:$lr:$optimizer:N/A:$model_size:N/A:N/A")
+                                    experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:N/A:$lr:$optimizer:N/A:$model_size:N/A:N/A")
                                     exp_id=$((exp_id + 1))
                                 done
-                            done
-                        elif [ "$mode" = "Instruct" ]; then
-                            for q in "${QUERY_BUDGETS[@]}"; do
-                                for lr in "${LEARNING_RATES_ZO[@]}"; do
-                                    for bp_interval in "${BP_INTERVALS[@]}"; do
-                                        for cos_target in "${INSTRUCT_COSINE_TARGETS[@]}"; do
-                                            for noise_scale in "${INSTRUCT_NOISE_SCALES[@]}"; do
-                                                experiments+=("$exp_id:$mode:$scope:$batch_size:$q:$lr:$optimizer:$bp_interval:$model_size:$cos_target:$noise_scale")
-                                                exp_id=$((exp_id + 1))
+                            elif [ "$mode" = "ZO" ]; then
+                                for q in "${QUERY_BUDGETS[@]}"; do
+                                    for lr in "${LEARNING_RATES_ZO[@]}"; do
+                                        experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:N/A:$model_size:N/A:N/A")
+                                        exp_id=$((exp_id + 1))
+                                    done
+                                done
+                            elif [ "$mode" = "Instruct" ]; then
+                                for q in "${QUERY_BUDGETS[@]}"; do
+                                    for lr in "${LEARNING_RATES_ZO[@]}"; do
+                                        for bp_interval in "${BP_INTERVALS[@]}"; do
+                                            for cos_target in "${INSTRUCT_COSINE_TARGETS[@]}"; do
+                                                for noise_scale in "${INSTRUCT_NOISE_SCALES[@]}"; do
+                                                    experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:$cos_target:$noise_scale")
+                                                    exp_id=$((exp_id + 1))
+                                                done
                                             done
                                         done
                                     done
                                 done
-                            done
-                        else
-                            for q in "${QUERY_BUDGETS[@]}"; do
-                                for lr in "${LEARNING_RATES_ZO[@]}"; do
-                                    for bp_interval in "${BP_INTERVALS[@]}"; do
-                                        experiments+=("$exp_id:$mode:$scope:$batch_size:$q:$lr:$optimizer:$bp_interval:$model_size:N/A:N/A")
-                                        exp_id=$((exp_id + 1))
+                            else
+                                for q in "${QUERY_BUDGETS[@]}"; do
+                                    for lr in "${LEARNING_RATES_ZO[@]}"; do
+                                        for bp_interval in "${BP_INTERVALS[@]}"; do
+                                            experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:N/A:N/A")
+                                            exp_id=$((exp_id + 1))
+                                        done
                                     done
                                 done
-                            done
-                        fi
+                            fi
+                        done
                     done
                 done
             done
@@ -372,7 +380,7 @@ run_single_experiment() {
     local exp_config="$1"
     local gpu_id="$2"
     
-    IFS=':' read -r exp_id mode scope batch_size q lr optimizer bp_interval model_size cos_target noise_scale <<< "$exp_config"
+    IFS=':' read -r exp_id mode scope batch_size block_size q lr optimizer bp_interval model_size cos_target noise_scale <<< "$exp_config"
     
     # 将 N/A 替换为 NA 以避免文件路径问题
     local q_safe="${q//\//_}"
@@ -387,7 +395,7 @@ run_single_experiment() {
     if [ "$noise_scale" != "N/A" ]; then
         noise_label="_ns${noise_safe}"
     fi
-    local exp_name="${mode}_${model_size}_${scope}_bs${batch_size}_q${q_safe}_bp${bp_safe}_opt${optimizer}_lr${lr}${cos_label}${noise_label}"
+    local exp_name="${mode}_${model_size}_${scope}_bs${batch_size}_blk${block_size}_q${q_safe}_bp${bp_safe}_opt${optimizer}_lr${lr}${cos_label}${noise_label}"
     local csv_file="${CSV_DIR}/${exp_name}.csv"
     local job_log="${JOB_LOG_DIR}/${exp_name}.log"
     local exp_log_dir="${EXPERIMENT_LOG_ROOT}/${exp_name}"
@@ -402,6 +410,7 @@ run_single_experiment() {
     cmd="$cmd --mode $mode"
     cmd="$cmd --scope $scope"
     cmd="$cmd --batch_size $batch_size"
+    cmd="$cmd --block_size $block_size"
     cmd="$cmd --learning_rate $lr"
     cmd="$cmd --optimizer $optimizer"
     cmd="$cmd --epochs $EPOCHS"

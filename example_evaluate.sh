@@ -3,7 +3,8 @@
 # Example script for evaluating checkpoints
 
 # 设置checkpoint路径（可以根据实际情况修改）
-CHECKPOINT_PATH="/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251109_221054/experiments/Instruct_20M_full_bs32_q8_bp1_optmudamw_lr1e-3_ct0.01_ns10.0/logs/parallel_sweep_20251109_221054/experiments/Instruct_20M_full_bs32_q8_bp1_optmudamw_lr1e-3_ct0.01_ns10.0/checkpoint"
+CHECKPOINT_PATH="/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251110_115549/experiments/Instruct_20M_full_bs128_q8_bp1_optmudamw_lr1e-3_ct0.01_ns10.0/logs/parallel_sweep_20251110_115549/experiments/Instruct_20M_full_bs128_q8_bp1_optmudamw_lr1e-3_ct0.01_ns10.0/checkpoint"
+# CHECKPOINT_PATH="/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251110_120901/experiments/FO_20M_full_bs32_qN_A_bpN_A_optmudamw_lr1e-3/logs/parallel_sweep_20251110_120901/experiments/FO_20M_full_bs32_qN_A_bpN_A_optmudamw_lr1e-3/checkpoint"
 
 # 示例1: 评估在cosmopedia数据集上的loss
 echo "========================================="

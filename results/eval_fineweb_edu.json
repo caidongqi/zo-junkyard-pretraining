@@ -1,13 +1,13 @@
 {
-  "checkpoint_path": "/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251109_130557/experiments/FO_20M_full_bs2_qN_A_bpN_A_optmudamw_lr1e-3/logs/parallel_sweep_20251109_130557/experiments/FO_20M_full_bs2_qN_A_bpN_A_optmudamw_lr1e-3/checkpoint",
+  "checkpoint_path": "/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251110_120901/experiments/FO_20M_full_bs32_qN_A_bpN_A_optmudamw_lr1e-3/logs/parallel_sweep_20251110_120901/experiments/FO_20M_full_bs32_qN_A_bpN_A_optmudamw_lr1e-3/checkpoint",
   "dataset": "fineweb-edu-10bt",
   "batch_size": 4,
   "block_size": 128,
   "max_samples": 5000,
   "max_batches": null,
   "device": "cuda",
-  "avg_loss": 6.011326874747198,
-  "perplexity": 408.0243225097656,
+  "avg_loss": 5.783960348685886,
+  "perplexity": 325.0439147949219,
   "total_tokens": 5191040,
   "model_config": {
     "activation_function": "gelu_new",
@@ -40,5 +40,5 @@
     "use_cache": true,
     "vocab_size": 50258
   },
-  "timestamp": "2025-11-09T18:29:26.381329"
+  "timestamp": "2025-11-10T15:53:11.762995"
 }

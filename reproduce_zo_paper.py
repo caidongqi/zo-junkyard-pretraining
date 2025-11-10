@@ -966,6 +966,7 @@ def train(
     model_size='200M',
     dataset_name='cosmopedia-100k',
     max_samples=None,
+    block_size=128,
     checkpoint_dir=None,
     logger=None,
     run_name=None,
@@ -984,10 +985,19 @@ def train(
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     
     model = create_model(model_size=model_size, vocab_size=len(tokenizer)).to(device)
+    
+    # 检查block_size是否超过模型的最大位置编码
+    max_positions = model.config.n_positions
+    if block_size > max_positions:
+        print(f"⚠️  Warning: block_size ({block_size}) exceeds model's max positions ({max_positions})")
+        print(f"   Automatically adjusting block_size to {max_positions}")
+        block_size = max_positions
+    
     dataloader = get_dataloader(
         tokenizer=tokenizer,
         dataset_name=dataset_name,
         batch_size=batch_size,
+        block_size=block_size,
         max_samples=max_samples,
     )
     
@@ -995,10 +1005,12 @@ def train(
     bp_dataloader = None
     if bp_dataset_name is not None and bp_dataset_name != dataset_name:
         print(f"Creating separate BP dataloader with dataset: {bp_dataset_name}")
+        # BP dataloader也使用调整后的block_size
         bp_dataloader = get_dataloader(
             tokenizer=tokenizer,
             dataset_name=bp_dataset_name,
             batch_size=batch_size,
+            block_size=block_size,
             max_samples=bp_max_samples,
         )
         if logger:
@@ -1013,7 +1025,7 @@ def train(
 
     if logger:
         logger.info(
-            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s optimizer=%s bp_interval=%s blend_bp_gradient=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s",
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_bp_gradient=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s",
             run_name or "unnamed",
             mode,
             scope,
@@ -1021,6 +1033,7 @@ def train(
             lr,
             epochs,
             batch_size,
+            block_size,
             optimizer_type,
             bp_interval,
             blend_bp_gradient,
@@ -1461,6 +1474,8 @@ if __name__ == "__main__":
                         help="Dataset name for training.")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Maximum number of samples to use from dataset. None=use recommended value.")
+    parser.add_argument("--block_size", type=int, default=128,
+                        help="Sequence length (block size) for tokenization (default: 128).")
     
     # BP数据集参数（用于Calibrate/Instruct模式）
     parser.add_argument("--bp_dataset", type=str, default=None,
@@ -1562,6 +1577,7 @@ if __name__ == "__main__":
         model_size=args.model_size,
         dataset_name=args.dataset,
         max_samples=args.max_samples,
+        block_size=args.block_size,
         checkpoint_dir=str(checkpoint_path) if checkpoint_path else None,
         logger=logger,
         run_name=run_name,
