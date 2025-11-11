@@ -15,6 +15,7 @@ import re
 from collections import deque
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+import numpy as np
 
 import matplotlib.pyplot as plt
 
@@ -115,6 +116,10 @@ def plot_series(
 
     plt.figure(figsize=(14, 7))
     for label, (steps, losses) in series.items():
+        print(label)
+        if label == 'FO_20M_full_bs32_blk512_qN_A_bpN_A_optmudamw_lr1e-3':
+            print("*4")
+            steps = 4 * np.array(steps)
         plt.plot(steps, losses, label=label)
 
     plt.xlabel(

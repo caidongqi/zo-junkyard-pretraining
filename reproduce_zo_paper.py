@@ -22,10 +22,38 @@ import matplotlib.pyplot as plt
 from model import create_model
 from data import get_dataloader
 
+from optimizer import MuDaMWOptimizer, CustomAdamOptimizer
+
+from generate_instruction import generate_instruct_directions_hybrid
+
 # --- 常量配置 (Constants) ---
 
 DEFAULT_INSTRUCT_COSINE_TARGET = 0.9
 DEFAULT_INSTRUCT_NOISE_SCALE = 0.5
+
+# --- 辅助函数：学习率调度器 (Helper Function: Learning Rate Scheduler) ---
+def get_cosine_schedule_with_warmup(
+    step: int,
+    total_steps: int,
+    warmup_steps: int,
+    max_lr: float,
+    min_lr: float
+):
+    """
+    根据当前步数计算学习率，包含线性预热和余弦退火。
+    """
+    # 1. 线性预热阶段
+    if step < warmup_steps:
+        return max_lr * step / warmup_steps
+    # 2. 超过总步数，返回最小学习率
+    if step > total_steps:
+        return min_lr
+    # 3. 余弦退火阶段
+    decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
+    assert 0.0 <= decay_ratio <= 1.0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 
 # --- 1. 配置与模型定义 (Configuration and Model Definition) ---
 # 注意: create_model 函数现在从 model.py 导入
@@ -265,696 +293,6 @@ def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
 
     return loss.detach(), grads
 
-
-def generate_instruct_directions_with_R(bp_grads, q, cosine_target, total_norm, total_norm_sq=None, device=None):
-    """生成基于低秩投影R的方向，使其与BP梯度具有较高余弦相似度。"""
-    if not bp_grads or q is None or q <= 0:
-        return None
-    if total_norm <= 1e-12:
-        return None
-
-    if device is None:
-        device = bp_grads[0].device if hasattr(bp_grads[0], 'device') else torch.device('cpu')
-
-    cosine_target = float(cosine_target)
-    cosine_target = max(min(cosine_target, 0.9999), -0.9999)
-    target_sign = -1.0 if cosine_target < 0.0 else 1.0
-
-    min_similarity = max(abs(cosine_target), 0.9)
-    min_similarity = min(min_similarity, 0.9999)
-    eps = 1e-12
-
-    grad_flat = torch.cat([g.flatten().to(device) for g in bp_grads])
-    d = grad_flat.numel()
-    total_norm_sq = float(torch.sum(grad_flat * grad_flat).item())
-    if total_norm_sq <= eps:
-        return None
-
-    energy_threshold = min_similarity ** 2 * total_norm_sq
-
-    abs_sq = grad_flat.abs().pow(2)
-    initial_rank = min(64, d)
-    k = max(1, initial_rank)
-
-    while True:
-        values, indices = torch.topk(abs_sq, k, largest=True)
-        captured_energy = float(values.sum().item())
-        if captured_energy >= energy_threshold or k >= d:
-            break
-        previous_k = k
-        k = min(k * 2, d)
-        if k == previous_k:
-            break
-
-    cumsum_values = torch.cumsum(values, dim=0)
-    if energy_threshold <= float(cumsum_values[-1].item()):
-        effective_rank_idx = torch.searchsorted(cumsum_values, torch.tensor(energy_threshold, device=cumsum_values.device))
-        effective_rank = int(effective_rank_idx.item()) + 1
-    else:
-        effective_rank = int(values.numel())
-
-    effective_rank = max(1, min(effective_rank, values.numel()))
-    # 候选索引池：使用更大的集合以支持随机采样多样性
-    candidate_pool_size = min(max(effective_rank * 2, 128), k)
-    candidate_indices = indices[:candidate_pool_size]
-
-    def generator():
-        total_start_time = time.time()
-        total_cosine_sim = 0.0
-        total_rank = 0
-        
-        for idx in range(q):
-            iter_start_time = time.time()
-
-            # 每次随机选择不同的索引集合
-            # 从候选池中随机采样，确保能量满足阈值
-            max_selected = min(candidate_pool_size, effective_rank * 2)
-            
-            # 尝试不同的采样策略：随机选择索引
-            num_selected = effective_rank
-            for attempt in range(10):  # 最多尝试10次
-                # 随机打乱候选索引并选择前num_selected个
-                perm = torch.randperm(candidate_pool_size, device=device)
-                selected_from_pool = perm[:num_selected]
-                selected_indices = candidate_indices[selected_from_pool]
-                
-                # 检查能量是否满足阈值
-                selected_abs_sq = abs_sq[selected_indices]
-                captured_energy = float(selected_abs_sq.sum().item())
-                
-                if captured_energy >= energy_threshold:
-                    break
-                # 如果能量不够，增加选择的索引数量
-                num_selected = min(num_selected + max(1, effective_rank // 4), max_selected)
-            
-            # 如果还是不够，使用top-k策略作为fallback
-            if captured_energy < energy_threshold:
-                selected_indices = indices[:effective_rank]
-
-            # 基于选中的索引生成方向
-            projection_flat = torch.zeros_like(grad_flat)
-            projection_flat[selected_indices] = grad_flat[selected_indices]
-
-            proj_norm = projection_flat.norm() + eps
-            if proj_norm <= eps:
-                projection_flat = grad_flat.clone()
-            else:
-                projection_flat = projection_flat * (total_norm / proj_norm)
-            projection_flat = projection_flat * target_sign
-
-            direction_flat = projection_flat
-            direction_norm = direction_flat.norm() + eps
-            actual_cosine_sim = torch.dot(direction_flat, grad_flat) / (direction_norm * total_norm)
-
-            # 累积统计信息
-            total_cosine_sim += actual_cosine_sim.item()
-            total_rank += len(selected_indices)
-
-            direction = []
-            start = 0
-            for g in bp_grads:
-                sz = g.numel()
-                out = direction_flat[start:start+sz].view_as(g)
-                if out.device != g.device:
-                    out = out.to(g.device)
-                direction.append(out)
-                start += sz
-
-            # 在最后一次迭代时打印汇总（放在 yield 之前，避免消费者停止后汇总丢失）
-            if idx == q - 1:
-                total_elapsed = time.time() - total_start_time
-                avg_cosine_sim = total_cosine_sim / q
-                avg_rank = total_rank / q
-                print(
-                    f"[Instruct] Summary: avg_rank={avg_rank:.1f}, avg_cosine_similarity={avg_cosine_sim:.6f}, "
-                    f"total_time={total_elapsed:.4f}s",
-                    flush=True,
-                )
-
-            yield direction
-
-    return generator()
-
-
-def generate_instruct_directions_hybrid(
-    bp_grads,
-    q,
-    cosine_target,
-    noise_scale,
-    device=None,
-):
-    """Generate hybrid directions that preserve high-energy gradient components and add noise elsewhere."""
-    if not bp_grads or q is None or q <= 0:
-        return None
-
-    sample_grad = bp_grads[0]
-    if device is None:
-        device = sample_grad.device if hasattr(sample_grad, "device") else torch.device("cpu")
-    dtype = sample_grad.dtype if hasattr(sample_grad, "dtype") else torch.float32
-
-    grad_flat = torch.cat([g.flatten().to(device=device, dtype=dtype) for g in bp_grads])
-    d = int(grad_flat.numel())
-    if d == 0:
-        return None
-
-    total_norm = torch.norm(grad_flat)
-    if total_norm <= 1e-12:
-        return None
-    total_norm_sq = total_norm * total_norm
-
-    cosine_target = float(cosine_target)
-    noise_scale = float(noise_scale)
-    min_similarity = max(min(abs(cosine_target), 0.9999), 0.9)
-    energy_threshold = float(min_similarity ** 2 * total_norm_sq)
-
-    abs_sq = grad_flat.abs().pow(2)
-    k = min(64, d)
-    while True:
-        values, indices = torch.topk(abs_sq, k, largest=True)
-        captured_energy = float(values.sum().item())
-        if captured_energy >= energy_threshold or k >= d:
-            break
-        next_k = min(k * 2, d)
-        if next_k == k:
-            break
-        k = next_k
-
-    threshold_tensor = torch.tensor(energy_threshold, device=values.device, dtype=values.dtype)
-    cumsum_values = torch.cumsum(values, dim=0)
-    effective_rank_idx = torch.searchsorted(cumsum_values, threshold_tensor)
-    effective_rank = int(effective_rank_idx.item()) + 1
-    effective_rank = max(1, min(effective_rank, values.numel()))
-
-    high_energy_indices = indices[:effective_rank]
-
-    def generator():
-        total_cosine = 0.0
-        start_time = time.time()
-
-        for direction_idx in range(int(q)):
-            hybrid_flat = torch.zeros_like(grad_flat)
-            hybrid_flat[high_energy_indices] = grad_flat[high_energy_indices]
-
-            low_energy_mask = torch.ones(grad_flat.shape, dtype=torch.bool, device=device)
-            low_energy_mask[high_energy_indices] = False
-            num_low_energy_dims = int(low_energy_mask.sum().item())
-
-            if num_low_energy_dims > 0 and noise_scale > 0.0:
-                noise_magnitude = noise_scale * (total_norm / (d ** 0.5))
-                noise = torch.randn(num_low_energy_dims, device=device, dtype=dtype) * noise_magnitude
-                hybrid_flat[low_energy_mask] = noise
-
-            hybrid_norm = torch.norm(hybrid_flat)
-            if hybrid_norm <= 1e-12:
-                final_similarity = 0.0
-            else:
-                final_similarity = float(torch.dot(hybrid_flat, grad_flat) / (hybrid_norm * total_norm))
-            total_cosine += final_similarity
-
-            print("-" * 60)
-            print(
-                f"[Instruct-Hybrid] direction #{direction_idx + 1}: "
-                f"d={d}, effective_rank={effective_rank} ({effective_rank / d:.2%} of total)"
-            )
-            print(f"  cosine_target={cosine_target}")
-            print(f"  noise_scale={noise_scale}")
-            print(f"  actual_cosine_similarity={final_similarity:.6f}")
-            print("-" * 60)
-
-            direction = []
-            start = 0
-            for grad in bp_grads:
-                size = grad.numel()
-                chunk = hybrid_flat[start:start + size].view_as(grad)
-                if chunk.device != grad.device or chunk.dtype != grad.dtype:
-                    chunk = chunk.to(device=grad.device, dtype=grad.dtype)
-                direction.append(chunk)
-                start += size
-
-            if direction_idx == int(q) - 1:
-                elapsed = time.time() - start_time
-                average_cosine = total_cosine / max(1, int(q))
-                print(
-                    f"[Instruct-Hybrid] Summary: avg_cosine_similarity={average_cosine:.6f}, "
-                    f"effective_rank={effective_rank}, "
-                    f"total_time={elapsed:.4f}s",
-                    flush=True,
-                )
-
-            yield direction
-
-    return generator()
-
-def generate_instruct_directions_blocked(
-    bp_grads,
-    q,
-    cosine_target,
-    total_norm,
-    device=None,
-    block_size=16384,
-    rank_per_block=8,
-    use_half_noise=True,
-):
-    """分块设置下基于低秩R投影生成高相似度的BP方向。"""
-    del use_half_noise
-
-    if not bp_grads or q <= 0:
-        return None
-
-    if device is None:
-        device = bp_grads[0].device if hasattr(bp_grads[0], 'device') else torch.device('cpu')
-
-    eps = 1e-12
-    cosine_target = max(min(float(cosine_target), 0.9999), -0.9999)
-    target_sign = -1.0 if cosine_target < 0.0 else 1.0
-
-    min_similarity = max(abs(cosine_target), 0.9)
-    min_similarity = min(min_similarity, 0.9999)
-
-    grad_flat = torch.cat([g.flatten().to(device) for g in bp_grads])
-    d = int(grad_flat.numel())
-    if d == 0:
-        return None
-
-    total_norm_sq = float(torch.sum(grad_flat * grad_flat).item())
-    if total_norm_sq <= eps:
-        return None
-
-    energy_threshold = min_similarity ** 2 * total_norm_sq
-
-    abs_sq = grad_flat.abs().pow(2)
-    block_size = max(int(block_size), 1)
-    num_blocks = max(1, math.ceil(d / block_size))
-    max_rank_cap = min(max(rank_per_block * num_blocks, 1), d)
-    initial_rank = min(max(rank_per_block, 1), d)
-    k = max(1, initial_rank)
-
-    while True:
-        values, indices = torch.topk(abs_sq, k, largest=True)
-        captured_energy = float(values.sum().item())
-        if captured_energy >= energy_threshold or k >= max_rank_cap:
-            break
-        next_k = min(k * 2, max_rank_cap)
-        if next_k == k:
-            break
-        k = next_k
-
-    if energy_threshold <= float(values.sum().item()):
-        cumsum_values = torch.cumsum(values, dim=0)
-        searched = torch.searchsorted(cumsum_values, torch.tensor(energy_threshold, device=cumsum_values.device))
-        effective_rank = int(searched.item()) + 1
-    else:
-        effective_rank = int(values.numel())
-
-    effective_rank = max(1, min(effective_rank, values.numel()))
-    # 候选索引池：使用更大的集合以支持随机采样多样性
-    candidate_pool_size = min(max(effective_rank * 2, 128), k)
-    candidate_indices = indices[:candidate_pool_size]
-
-    def generator():
-        total_start_time = time.time()
-        total_cosine_sim = 0.0
-        total_rank = 0
-        
-        for idx in range(q):
-            iter_start_time = time.time()
-
-            # 每次随机选择不同的索引集合
-            # 从候选池中随机采样，确保能量满足阈值
-            max_selected = min(candidate_pool_size, effective_rank * 2)
-            
-            # 尝试不同的采样策略：随机选择索引
-            num_selected = effective_rank
-            captured_energy = 0.0
-            for attempt in range(10):  # 最多尝试10次
-                # 随机打乱候选索引并选择前num_selected个
-                perm = torch.randperm(candidate_pool_size, device=device)
-                selected_from_pool = perm[:num_selected]
-                selected_indices = candidate_indices[selected_from_pool]
-                
-                # 检查能量是否满足阈值
-                selected_abs_sq = abs_sq[selected_indices]
-                captured_energy = float(selected_abs_sq.sum().item())
-                
-                if captured_energy >= energy_threshold:
-                    break
-                # 如果能量不够，增加选择的索引数量
-                num_selected = min(num_selected + max(1, effective_rank // 4), max_selected)
-            
-            # 如果还是不够，使用top-k策略作为fallback
-            if captured_energy < energy_threshold:
-                selected_indices = indices[:effective_rank]
-
-            # 基于选中的索引生成方向
-            projection_flat = torch.zeros_like(grad_flat)
-            projection_flat[selected_indices] = grad_flat[selected_indices]
-
-            proj_norm = projection_flat.norm() + eps
-            if proj_norm <= eps:
-                projection_flat = grad_flat.clone()
-            else:
-                projection_flat = projection_flat * (total_norm / proj_norm)
-            projection_flat = projection_flat * target_sign
-
-            direction_flat = projection_flat
-            direction_norm = direction_flat.norm() + eps
-            actual_cosine_sim = torch.dot(direction_flat, grad_flat) / (direction_norm * total_norm)
-
-            # 累积统计信息
-            total_cosine_sim += actual_cosine_sim.item()
-            total_rank += len(selected_indices)
-
-            direction = []
-            start = 0
-            for g in bp_grads:
-                sz = g.numel()
-                dir_tensor = direction_flat[start:start+sz].view_as(g)
-                if g.device != device:
-                    dir_tensor = dir_tensor.to(g.device)
-                direction.append(dir_tensor)
-                start += sz
-
-            # 在最后一次迭代时打印汇总（放在 yield 之前，避免消费者停止后汇总丢失）
-            if idx == q - 1:
-                total_elapsed = time.time() - total_start_time
-                avg_cosine_sim = total_cosine_sim / q
-                avg_rank = total_rank / q
-                print(
-                    f"[Block Instruct] Summary: avg_rank={avg_rank:.1f}, avg_cosine_similarity={avg_cosine_sim:.6f}, "
-                    f"total_time={total_elapsed:.4f}s, device={device}",
-                    flush=True,
-                )
-
-            yield direction
-
-    return generator()
-
-def generate_instruct_directions(bp_grads, q, cosine_target, total_norm, total_norm_sq, device):
-    """生成与BP梯度方向保持给定余弦相似度的方向迭代器。"""
-    if not bp_grads or q is None or q <= 0:
-        return None
-
-    if total_norm <= 1e-12:
-        return None
-
-    cosine_target = float(cosine_target)
-    cosine_target = max(min(cosine_target, 0.9999), -0.9999)
-    orth_scale = math.sqrt(max(0.0, 1.0 - cosine_target ** 2))
-    eps = 1e-12
-
-    # 将 total_norm_sq 转换为 GPU tensor
-    total_norm_sq_tensor = torch.tensor(total_norm_sq, device=device, dtype=torch.float32)
-    total_norm_tensor = torch.tensor(total_norm, device=device, dtype=torch.float32)
-    eps_tensor = torch.tensor(eps, device=device, dtype=torch.float32)
-
-    def generator():
-        total_start_time = time.time()
-        total_cosine_sim = 0.0
-        
-        for idx in range(q):
-            noises = None
-            for _attempt in range(6):
-                # 在 GPU 上生成随机噪声
-                noises = [torch.randn_like(g, device=device) for g in bp_grads]
-                
-                # GPU 上计算点积
-                dot = torch.tensor(0.0, device=device)
-                for noise, grad in zip(noises, bp_grads):
-                    dot += torch.sum(noise * grad)
-                
-                # GPU 上计算投影系数
-                proj_coeff = dot / (total_norm_sq_tensor + eps_tensor)
-                
-                # GPU 上进行正交化
-                for i in range(len(noises)):
-                    noises[i] = noises[i] - proj_coeff * bp_grads[i]
-
-                # GPU 上计算噪声范数
-                noise_norm_sq = torch.tensor(0.0, device=device)
-                for noise in noises:
-                    noise_norm_sq += torch.sum(noise * noise)
-
-                if noise_norm_sq > eps:
-                    noise_norm = torch.sqrt(noise_norm_sq)
-                    for i in range(len(noises)):
-                        noises[i] = noises[i] / (noise_norm + eps_tensor)
-                    break
-            else:
-                # 失败后的处理
-                noises = [torch.randn_like(g, device=device) for g in bp_grads]
-                noise_norm_sq = torch.tensor(0.0, device=device)
-                for n in noises:
-                    noise_norm_sq += torch.sum(n * n)
-                noise_norm = torch.sqrt(noise_norm_sq + eps_tensor)
-                for i in range(len(noises)):
-                    noises[i] = noises[i] / (noise_norm + eps_tensor)
-
-            # GPU 上生成最终方向
-            direction = []
-            for grad, noise in zip(bp_grads, noises):
-                dir_tensor = cosine_target * grad + orth_scale * total_norm_tensor * noise
-                direction.append(dir_tensor)
-            
-            # 计算实际的余弦相似度
-            dot_product = torch.tensor(0.0, device=device)
-            direction_norm_sq = torch.tensor(0.0, device=device)
-            for dir_t, grad in zip(direction, bp_grads):
-                dot_product += torch.sum(dir_t * grad)
-                direction_norm_sq += torch.sum(dir_t * dir_t)
-            
-            direction_norm = torch.sqrt(direction_norm_sq + eps_tensor)
-            actual_cosine_sim = dot_product / (direction_norm * total_norm_tensor + eps_tensor)
-            
-            # 累积统计信息
-            total_cosine_sim += actual_cosine_sim.item()
-            
-            # 在最后一次迭代时打印汇总
-            if idx == q - 1:
-                total_elapsed = time.time() - total_start_time
-                avg_cosine_sim = total_cosine_sim / q
-                print(
-                    f"[Instruct-GramSchmidt] Summary: avg_cosine_similarity={avg_cosine_sim:.6f}, "
-                    f"target={cosine_target:.6f}, total_time={total_elapsed:.4f}s, device={device}",
-                    flush=True,
-                )
-            
-            yield direction
-
-    return generator()
-
-
-# --- 3.5. 优化器实现 (Optimizer Implementations) ---
-
-def _zeropower_via_newtonschulz5_torch(G, steps=5):
-    """Newton-Schulz 迭代计算零次幂投影（用于 MuDaMW）"""
-    assert G.dim() == 2
-    a, b, c = 3.4445, -4.7750, 2.0315
-    X = G
-    if G.shape[0] > G.shape[1]:
-        X = X.T
-    X = X / (torch.norm(X) + 1e-7)
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
-    if G.shape[0] > G.shape[1]:
-        X = X.T
-    return X
-
-def _adjust_lr_for_muon_torch(lr, shape):
-    """调整学习率（用于 MuDaMW）"""
-    A, B = shape[:2]
-    return lr * (0.2 * math.sqrt(max(A, B)))
-
-class CustomAdamOptimizer:
-    """自定义 Adam 优化器（可用于 FO 和 ZO）"""
-    def __init__(self, params, lr=1e-3, beta1=0.9, beta2=0.999, epsilon=1e-8):
-        self.params = list(params)
-        self.lr = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.epsilon = epsilon
-        self.t = 0
-        self.m = [torch.zeros_like(p.data) for p in self.params]
-        self.v = [torch.zeros_like(p.data) for p in self.params]
-    
-    def zero_grad(self):
-        for p in self.params:
-            if p.grad is not None:
-                p.grad.zero_()
-    
-    def step(self, grads=None):
-        """
-        执行一步优化更新
-        grads: 可选，外部提供的梯度列表（用于 ZO）。如果为 None，则使用参数的 .grad
-        """
-        self.t += 1
-        
-        for i, p in enumerate(self.params):
-            if grads is not None:
-                g = grads[i]
-            else:
-                if p.grad is None:
-                    continue
-                g = p.grad.data
-            
-            if g is None:
-                continue
-            
-            # Adam 更新
-            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * g
-            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (g ** 2)
-            
-            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
-            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
-            
-            p.data -= self.lr * m_hat / (torch.sqrt(v_hat) + self.epsilon)
-
-    def state_dict(self):
-        return {
-            'lr': self.lr,
-            'beta1': self.beta1,
-            'beta2': self.beta2,
-            'epsilon': self.epsilon,
-            't': self.t,
-            'm': [m.clone() for m in self.m],
-            'v': [v.clone() for v in self.v],
-        }
-
-    def load_state_dict(self, state):
-        self.lr = state.get('lr', self.lr)
-        self.beta1 = state.get('beta1', self.beta1)
-        self.beta2 = state.get('beta2', self.beta2)
-        self.epsilon = state.get('epsilon', self.epsilon)
-        self.t = state.get('t', 0)
-
-        m_state = state.get('m', [])
-        v_state = state.get('v', [])
-        if len(m_state) != len(self.m) or len(v_state) != len(self.v):
-            raise ValueError("State dict does not match parameter groups for CustomAdamOptimizer")
-
-        for i in range(len(self.m)):
-            self.m[i] = m_state[i].clone().to(device=self.params[i].device, dtype=self.params[i].dtype)
-            self.v[i] = v_state[i].clone().to(device=self.params[i].device, dtype=self.params[i].dtype)
-
-class MuDaMWOptimizer:
-    """MuDaMW 优化器（基于 flwr_server.py 的实现）"""
-    def __init__(self, params, lr=1e-3, beta1=0.9, beta2=0.999, epsilon=1e-6, 
-                 weight_decay=0.0, correct_bias=True, cautious=False, hidden_size=768):
-        self.params = list(params)
-        self.lr = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.epsilon = epsilon
-        self.weight_decay = weight_decay
-        self.correct_bias = correct_bias
-        self.cautious = cautious
-        self.hidden_size = hidden_size
-        self.t = 0
-        self.exp_avg = [torch.zeros_like(p.data) for p in self.params]
-        self.exp_avg_sq = [torch.zeros_like(p.data) for p in self.params]
-    
-    def zero_grad(self):
-        for p in self.params:
-            if p.grad is not None:
-                p.grad.zero_()
-    
-    def step(self, grads=None):
-        """
-        执行一步优化更新
-        grads: 可选，外部提供的梯度列表（用于 ZO）。如果为 None，则使用参数的 .grad
-        """
-        self.t += 1
-        
-        for i, p in enumerate(self.params):
-            if grads is not None:
-                g = grads[i]
-            else:
-                if p.grad is None:
-                    continue
-                g = p.grad.data
-            
-            if g is None:
-                continue
-            
-            # Decoupled weight decay
-            if self.weight_decay > 0.0:
-                p.data.add_(p.data, alpha=-self.lr * self.weight_decay)
-            
-            # 一二阶动量
-            self.exp_avg[i] = self.beta1 * self.exp_avg[i] + (1.0 - self.beta1) * g
-            self.exp_avg_sq[i] = self.beta2 * self.exp_avg_sq[i] + (1.0 - self.beta2) * (g ** 2)
-            
-            denom = torch.sqrt(self.exp_avg_sq[i]) + self.epsilon
-            
-            # 偏置校正
-            step_size = self.lr
-            if self.correct_bias:
-                bias_correction1 = 1.0 - (self.beta1 ** self.t)
-                bias_correction2 = 1.0 - (self.beta2 ** self.t)
-                step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
-            
-            # 归一化梯度（可选 cautious）
-            if self.cautious:
-                mask = (self.exp_avg[i] * g > 0).float()
-                scale = mask.numel() / (mask.sum() + 1.0)
-                mask = mask * scale
-                norm_grad = (self.exp_avg[i] * mask) / denom
-            else:
-                norm_grad = self.exp_avg[i] / denom
-            
-            # 一维向量 → 2D 正交化
-            if norm_grad.dim() == 1 and norm_grad.numel() % self.hidden_size == 0 and norm_grad.numel() > self.hidden_size:
-                G = norm_grad.reshape(self.hidden_size, -1)
-                adj_lr = _adjust_lr_for_muon_torch(step_size, G.shape)
-                G = _zeropower_via_newtonschulz5_torch(G, steps=5)
-                norm_grad = G.reshape(-1)
-                step = adj_lr
-            elif norm_grad.dim() == 2:
-                # 对于 2D 参数（如权重矩阵），直接应用正交化
-                adj_lr = _adjust_lr_for_muon_torch(step_size, norm_grad.shape)
-                norm_grad = _zeropower_via_newtonschulz5_torch(norm_grad, steps=5)
-                step = adj_lr
-            else:
-                step = step_size
-            
-            p.data.add_(norm_grad, alpha=-step)
-
-    def state_dict(self):
-        return {
-            'lr': self.lr,
-            'beta1': self.beta1,
-            'beta2': self.beta2,
-            'epsilon': self.epsilon,
-            'weight_decay': self.weight_decay,
-            'correct_bias': self.correct_bias,
-            'cautious': self.cautious,
-            'hidden_size': self.hidden_size,
-            't': self.t,
-            'exp_avg': [buf.clone() for buf in self.exp_avg],
-            'exp_avg_sq': [buf.clone() for buf in self.exp_avg_sq],
-        }
-
-    def load_state_dict(self, state):
-        self.lr = state.get('lr', self.lr)
-        self.beta1 = state.get('beta1', self.beta1)
-        self.beta2 = state.get('beta2', self.beta2)
-        self.epsilon = state.get('epsilon', self.epsilon)
-        self.weight_decay = state.get('weight_decay', self.weight_decay)
-        self.correct_bias = state.get('correct_bias', self.correct_bias)
-        self.cautious = state.get('cautious', self.cautious)
-        self.hidden_size = state.get('hidden_size', self.hidden_size)
-        self.t = state.get('t', 0)
-
-        exp_avg_state = state.get('exp_avg', [])
-        exp_avg_sq_state = state.get('exp_avg_sq', [])
-        if len(exp_avg_state) != len(self.exp_avg) or len(exp_avg_sq_state) != len(self.exp_avg_sq):
-            raise ValueError("State dict does not match parameter groups for MuDaMWOptimizer")
-
-        for i in range(len(self.exp_avg)):
-            self.exp_avg[i] = exp_avg_state[i].clone().to(device=self.params[i].device, dtype=self.params[i].dtype)
-            self.exp_avg_sq[i] = exp_avg_sq_state[i].clone().to(device=self.params[i].device, dtype=self.params[i].dtype)
-
 # --- 4. 训练循环 (Training Loops) ---
 
 def train(
@@ -974,6 +312,7 @@ def train(
     model_size='200M',
     dataset_name='cosmopedia-100k',
     max_samples=None,
+    block_size=128,
     checkpoint_dir=None,
     logger=None,
     run_name=None,
@@ -982,6 +321,12 @@ def train(
     blend_bp_gradient=False,
     instruct_cosine_target=DEFAULT_INSTRUCT_COSINE_TARGET,
     instruct_noise_scale=DEFAULT_INSTRUCT_NOISE_SCALE,
+    # 新增LR调度器参数
+    use_lr_scheduler=False,
+    warmup_steps=300,
+    min_lr=1e-6,
+    # 新增梯度累积参数
+    gradient_accumulation_steps=1,
 ):
     """主训练函数"""
     
@@ -992,10 +337,19 @@ def train(
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     
     model = create_model(model_size=model_size, vocab_size=len(tokenizer)).to(device)
+    
+    # 检查block_size是否超过模型的最大位置编码
+    max_positions = model.config.n_positions
+    if block_size > max_positions:
+        print(f"⚠️  Warning: block_size ({block_size}) exceeds model's max positions ({max_positions})")
+        print(f"   Automatically adjusting block_size to {max_positions}")
+        block_size = max_positions
+    
     dataloader = get_dataloader(
         tokenizer=tokenizer,
         dataset_name=dataset_name,
         batch_size=batch_size,
+        block_size=block_size,
         max_samples=max_samples,
     )
     
@@ -1003,10 +357,12 @@ def train(
     bp_dataloader = None
     if bp_dataset_name is not None and bp_dataset_name != dataset_name:
         print(f"Creating separate BP dataloader with dataset: {bp_dataset_name}")
+        # BP dataloader也使用调整后的block_size
         bp_dataloader = get_dataloader(
             tokenizer=tokenizer,
             dataset_name=bp_dataset_name,
             batch_size=batch_size,
+            block_size=block_size,
             max_samples=bp_max_samples,
         )
         if logger:
@@ -1021,7 +377,7 @@ def train(
 
     if logger:
         logger.info(
-            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s optimizer=%s bp_interval=%s blend_bp_gradient=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s",
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_bp_gradient=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s use_lr_scheduler=%s warmup_steps=%s min_lr=%s",
             run_name or "unnamed",
             mode,
             scope,
@@ -1029,6 +385,9 @@ def train(
             lr,
             epochs,
             batch_size,
+            gradient_accumulation_steps,
+            batch_size * gradient_accumulation_steps,
+            block_size,
             optimizer_type,
             bp_interval,
             blend_bp_gradient,
@@ -1040,6 +399,9 @@ def train(
             max_samples,
             bp_dataset_name or "same_as_main",
             bp_max_samples or "default",
+            use_lr_scheduler,
+            warmup_steps if use_lr_scheduler else 'N/A',
+            min_lr if use_lr_scheduler else 'N/A',
         )
     
     # 确定可训练参数
@@ -1157,8 +519,11 @@ def train(
                 'mode',
                 'scope',
                 'q',
-                'lr',
+                'initial_lr',
+                'current_lr',
                 'batch_size',
+                'gradient_accumulation_steps',
+                'effective_batch_size',
                 'optimizer',
                 'bp_interval',
                 'loss',
@@ -1168,42 +533,106 @@ def train(
     # 开始训练
     model.train()
     step = 0
+    # 计算总优化步数（考虑梯度累积）
+    batches_per_epoch = len(dataloader)
+    total_optimization_steps = (batches_per_epoch * epochs) // gradient_accumulation_steps
+    total_steps = total_optimization_steps  # 用于LR调度器
+    
     last_metrics = {
         'loss': None,
         'grad_norm': None,
         'epoch': None,
         'step': None,
     }
+    
+    # 梯度累积计数器
+    accumulation_counter = 0
+    accumulated_loss = 0.0
+    
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         if logger:
             logger.info("Epoch %s/%s started", epoch + 1, epochs)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            # --- 学习率计算 ---
+            if use_lr_scheduler:
+                current_lr = get_cosine_schedule_with_warmup(
+                    step=step,
+                    total_steps=total_steps,
+                    warmup_steps=warmup_steps,
+                    max_lr=lr,  # args.learning_rate 作为最大学习率
+                    min_lr=min_lr,
+                )
+                # 动态更新优化器内的学习率
+                if optimizer is not None:
+                    if hasattr(optimizer, 'param_groups'):
+                        # PyTorch 标准优化器
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = current_lr
+                    elif hasattr(optimizer, 'lr'):
+                        # 自定义优化器（CustomAdamOptimizer, MuDaMWOptimizer）
+                        optimizer.lr = current_lr
+            else:
+                current_lr = lr # 如果不使用调度器，则保持固定学习率
+
             inputs = batch.to(device)
             labels = inputs.clone()
 
             grad_norm = 0.0  # 默认值
             
             if mode == 'FO':
-                if hasattr(optimizer, 'zero_grad'):
-                    optimizer.zero_grad()
+                # FO模式：支持梯度累积
                 logits = model(inputs).logits
                 # Shift logits and labels for next-token prediction
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                loss.backward()
                 
-                # 计算梯度范数（用于记录）
-                grad_norm_sq = 0.0
-                for p in trainable_params:
-                    if p.grad is not None:
-                        grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
-                grad_norm = math.sqrt(grad_norm_sq)
+                # 梯度累积：损失除以累积步数以保持梯度尺度
+                scaled_loss = loss / gradient_accumulation_steps
+                scaled_loss.backward()
                 
-                optimizer.step()
+                # 累积损失（用于记录）
+                accumulated_loss += loss.item()
+                accumulation_counter += 1
+                
+                # 只在累积到指定步数时才更新参数
+                should_update = (accumulation_counter >= gradient_accumulation_steps)
+                
+                if should_update:
+                    # 计算梯度范数（用于记录）
+                    grad_norm_sq = 0.0
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
+                    grad_norm = math.sqrt(grad_norm_sq)
+                    
+                    # 更新参数
+                    optimizer.step()
+                    
+                    # 清零梯度
+                    if hasattr(optimizer, 'zero_grad'):
+                        optimizer.zero_grad()
+                    else:
+                        for p in trainable_params:
+                            if p.grad is not None:
+                                p.grad.zero_()
+                    
+                    # 计算平均损失
+                    loss = torch.tensor(accumulated_loss / accumulation_counter)
+                    
+                    # 重置累积计数器
+                    accumulation_counter = 0
+                    accumulated_loss = 0.0
+                    
+                    # 增加优化步数
+                    step += 1
+                else:
+                    # 如果还在累积阶段，跳过日志记录和checkpoint
+                    continue
             
             elif mode in zo_like_modes:
+                # ZO模式：每个batch都是一次优化步骤
                 should_use_bp = (
                     mode in {'Calibrate', 'Instruct'}
                     and bp_interval is not None
@@ -1262,10 +691,6 @@ def train(
 
                 # 在Calibrate模式下使用BP梯度
                 if mode == 'Calibrate' and should_use_bp and bp_grads is not None:
-                    # grad_paramwise = [
-                        # 0.5 * (gz + gb)
-                        # for gz, gb in zip(grad_paramwise, bp_grads)
-                    # ]
                     grad_paramwise = bp_grads
                 
                 # 在Instruct模式下，可选择混合BP和ZO梯度
@@ -1281,13 +706,17 @@ def train(
                         grad_norm_sq += float(torch.sum(g.detach() * g.detach()).item())
                 grad_norm = math.sqrt(grad_norm_sq)
 
-                if optimizer is None:
+                if optimizer is None: # 手动 SGD 更新
                     for p, g in zip(trainable_params, grad_paramwise):
                         if g is None:
                             continue
-                        p.data -= lr * g
-                else:
+                        p.data -= current_lr * g # 使用动态学习率
+                else: # 使用 Adam 或 MuDaMW
+                    # 优化器的学习率已在循环开始时更新
                     optimizer.step(grads=grad_paramwise)
+                
+                # ZO模式：每个batch后增加step
+                step += 1
 
             losses.append(loss.item())
             current_step = step
@@ -1316,8 +745,11 @@ def train(
                             mode,
                             scope,
                             row_q,
-                            lr,
+                            lr, # 初始最大学习率
+                            current_lr, # 当前学习率
                             batch_size,
+                            gradient_accumulation_steps if mode == 'FO' else 1,
+                            batch_size * (gradient_accumulation_steps if mode == 'FO' else 1),
                             optimizer_type,
                             row_bp_interval,
                             loss.item(),
@@ -1326,11 +758,12 @@ def train(
 
                 if logger:
                     logger.info(
-                        "step=%s epoch=%s loss=%.6f grad_norm=%.6f mode=%s scope=%s q=%s bp_interval=%s",
+                        "step=%s epoch=%s loss=%.6f grad_norm=%.6f lr=%.6e mode=%s scope=%s q=%s bp_interval=%s",
                         current_step,
                         epoch + 1,
                         loss.item(),
                         grad_norm,
+                        current_lr,
                         mode,
                         scope,
                         row_q,
@@ -1350,8 +783,11 @@ def train(
                         'epoch': epoch + 1,
                         'step': current_step,
                         'q': q if mode in zo_like_modes else None,
-                        'learning_rate': lr,
+                        'learning_rate': lr, # 初始最大学习率
+                        'current_learning_rate': current_lr, # 当前学习率
                         'batch_size': batch_size,
+                        'gradient_accumulation_steps': gradient_accumulation_steps if mode == 'FO' else 1,
+                        'effective_batch_size': batch_size * (gradient_accumulation_steps if mode == 'FO' else 1),
                         'optimizer': optimizer_type,
                         'bp_interval': bp_interval if mode in {'Calibrate', 'Instruct'} else None,
                         'loss': float(loss.item()),
@@ -1362,6 +798,9 @@ def train(
                         'checkpoint_type': 'periodic',
                         'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
                         'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
+                        'use_lr_scheduler': use_lr_scheduler,
+                        'warmup_steps': warmup_steps if use_lr_scheduler else None,
+                        'min_lr': min_lr if use_lr_scheduler else None,
                     }
                     save_latest_checkpoint(
                         model,
@@ -1374,6 +813,7 @@ def train(
             
             postfix = {
                 "loss": f"{loss.item():.4f}",
+                "lr": f"{current_lr:.2e}", # 在进度条中显示当前学习率
                 "grad_norm": f"{grad_norm:.4f}",
                 "opt": optimizer_type
             }
@@ -1383,8 +823,6 @@ def train(
                     postfix["bp_int"] = bp_interval
 
             pbar.set_postfix(postfix)
-            
-            step += 1
         if logger:
             logger.info("Epoch %s/%s completed", epoch + 1, epochs)
 
@@ -1402,6 +840,8 @@ def train(
             'q': q if mode in zo_like_modes else None,
             'learning_rate': lr,
             'batch_size': batch_size,
+            'gradient_accumulation_steps': gradient_accumulation_steps if mode == 'FO' else 1,
+            'effective_batch_size': batch_size * (gradient_accumulation_steps if mode == 'FO' else 1),
             'optimizer': optimizer_type,
             'bp_interval': bp_interval if mode in {'Calibrate', 'Instruct'} else None,
             'loss': last_metrics['loss'],
@@ -1412,6 +852,9 @@ def train(
             'checkpoint_type': 'final',
             'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
             'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
+            'use_lr_scheduler': use_lr_scheduler,
+            'warmup_steps': warmup_steps if use_lr_scheduler else None,
+            'min_lr': min_lr if use_lr_scheduler else None,
         }
         save_latest_checkpoint(
             model,
@@ -1430,9 +873,10 @@ def train(
     plt.plot(losses)
     q_text = q if mode in zo_like_modes else 'N/A'
     bp_text = bp_interval if mode in {'Calibrate', 'Instruct'} else 'N/A'
+    scheduler_text = f"Scheduler(warmup={warmup_steps})" if use_lr_scheduler else "Fixed LR"
     plt.title(
         f'Training Loss Curve\nMode={mode}, Scope={scope}, q={q_text}, BP-Interval={bp_text}, '
-        f'LR={lr}, Optimizer={optimizer_type.upper()}'
+        f'LR={lr}, Optimizer={optimizer_type.upper()}, {scheduler_text}'
     )
     plt.xlabel('Training Steps')
     plt.ylabel('Cross-Entropy Loss')
@@ -1448,9 +892,11 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, required=True, choices=['FO', 'ZO', 'Calibrate', 'Instruct'], help="Optimization mode.")
     parser.add_argument("--scope", type=str, default='reduced', choices=['full', 'reduced'], help="Training scope: 'full' model or 'reduced' (last layer only).")
     parser.add_argument("--query_budget_q", type=int, default=1, help="Query budget (q) for ZO. Number of random directions.")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate (acts as max_lr if scheduler is used).")
     parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of gradient accumulation steps (only for FO mode). Effective batch size = batch_size * gradient_accumulation_steps.")
     parser.add_argument("--optimizer", type=str, default='sgd', choices=['sgd', 'adam', 'mudamw'], 
                         help="Optimizer type: SGD (vanilla), Adam, or MuDaMW.")
     parser.add_argument("--csv_file", type=str, default=None, help="CSV file to save training logs.")
@@ -1477,6 +923,8 @@ if __name__ == "__main__":
                         help="Dataset name for training.")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Maximum number of samples to use from dataset. None=use recommended value.")
+    parser.add_argument("--block_size", type=int, default=128,
+                        help="Sequence length (block size) for tokenization (default: 128).")
     
     # BP数据集参数（用于Calibrate/Instruct模式）
     parser.add_argument("--bp_dataset", type=str, default=None,
@@ -1494,6 +942,14 @@ if __name__ == "__main__":
                         help="Target cosine similarity for hybrid instruct direction generation.")
     parser.add_argument("--instruct_noise_scale", type=float, default=DEFAULT_INSTRUCT_NOISE_SCALE,
                         help="Noise scale for hybrid instruct direction generation.")
+
+    # 新增：学习率调度器参数
+    parser.add_argument("--use_lr_scheduler", action="store_true",
+                        help="Enable cosine learning rate scheduler with warmup.")
+    parser.add_argument("--warmup_steps", type=int, default=300,
+                        help="Number of warmup steps for the LR scheduler.")
+    parser.add_argument("--min_lr", type=float, default=1e-6,
+                        help="Minimum learning rate for cosine annealing.")
     
     args = parser.parse_args()
 
@@ -1578,6 +1034,7 @@ if __name__ == "__main__":
         model_size=args.model_size,
         dataset_name=args.dataset,
         max_samples=args.max_samples,
+        block_size=args.block_size,
         checkpoint_dir=str(checkpoint_path) if checkpoint_path else None,
         logger=logger,
         run_name=run_name,
@@ -1586,6 +1043,12 @@ if __name__ == "__main__":
         blend_bp_gradient=args.blend_bp_gradient,
         instruct_cosine_target=args.instruct_cosine_target,
         instruct_noise_scale=args.instruct_noise_scale,
+        # 传递调度器参数
+        use_lr_scheduler=args.use_lr_scheduler,
+        warmup_steps=args.warmup_steps,
+        min_lr=args.min_lr,
+        # 传递梯度累积参数
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     print(f"CSV metrics saved to {csv_file_path}")
