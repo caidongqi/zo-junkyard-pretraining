@@ -181,6 +181,10 @@ def zo_gradient_estimator(
             p.data = p0.clone()
 
         proj_grads.append(((loss_pos - loss_neg) / (2 * epsilon)).item())
+        
+        # 清理显存（每个query后）
+        if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
+            torch.cuda.empty_cache()
 
     # 重建随机方向贡献
     for seed, proj in zip(seeds, proj_grads):
@@ -233,10 +237,9 @@ def save_latest_checkpoint(
 
 def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels):
     """执行一次标准BP，返回loss和每个参数的梯度副本。"""
-    for p in trainable_params:
-        if p.grad is not None:
-            p.grad.zero_()
-
+    # 清理之前的梯度，使用set_to_none=True以释放显存
+    model.zero_grad(set_to_none=True)
+    
     with torch.enable_grad():
         logits = model(inputs).logits
         # Shift logits and labels for next-token prediction
@@ -253,7 +256,12 @@ def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
         else:
             grads.append(p.grad.detach().clone())
 
-    model.zero_grad(set_to_none=False)
+    # 清理梯度，使用set_to_none=True以释放显存
+    model.zero_grad(set_to_none=True)
+    
+    # 清理显存缓存
+    if inputs.device.type == 'cuda':
+        torch.cuda.empty_cache()
 
     return loss.detach(), grads
 
@@ -1205,12 +1213,20 @@ def train(
 
                 bp_grads = None
                 if should_use_bp:
+                    # 在计算BP梯度前清理显存
+                    if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
+                        torch.cuda.empty_cache()
+                    
                     # 如果有单独的BP数据集，则使用它；否则使用当前训练batch
                     if bp_batch_provider is not None:
                         bp_inputs, bp_labels = bp_batch_provider()
                         _, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, bp_inputs, bp_labels)
                     else:
                         _, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
+                    
+                    # 计算BP梯度后清理显存
+                    if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
+                        torch.cuda.empty_cache()
 
                 epsilon = 1e-4  # 增大扰动大小以提高数值稳定性
 

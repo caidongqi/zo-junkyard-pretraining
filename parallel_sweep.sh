@@ -21,7 +21,7 @@ PID_FILE=""
 CLEANUP_DONE=false
 
 # 默认配置参数
-MODES=("FO" "Instruct") # 可选: FO, ZO, Calibrate, Instruct
+MODES=("Instruct") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
 BATCH_SIZES=(32)
 QUERY_BUDGETS=(8)
@@ -37,7 +37,7 @@ LOGS_ROOT="logs"
 
 # 模型配置 (Model Configuration)
 # 备选: 20M (超小型，快速实验), 200M (中小型，类似GPT-2 Small), 500M (中型), 1B (大型)
-MODEL_SIZES=("500M")  # 默认使用200M模型，可以是数组如: ("20M" "200M" "500M" "1B")
+MODEL_SIZES=("200M")  # 默认使用200M模型，可以是数组如: ("20M" "200M" "500M" "1B")
 
 # 数据集配置 (Dataset Configuration)
 # 备选数据集:
@@ -68,7 +68,7 @@ BP_MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字
 
 # 并行配置
 MAX_PARALLEL_JOBS=32 # 最大并行任务数
-GPU_IDS="6"           # GPU ID列表，空表示自动检测
+GPU_IDS="5"           # GPU ID列表，空表示自动检测
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
