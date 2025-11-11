@@ -31,6 +31,30 @@ from generate_instruction import generate_instruct_directions_hybrid
 DEFAULT_INSTRUCT_COSINE_TARGET = 0.9
 DEFAULT_INSTRUCT_NOISE_SCALE = 0.5
 
+# --- 辅助函数：学习率调度器 (Helper Function: Learning Rate Scheduler) ---
+def get_cosine_schedule_with_warmup(
+    step: int,
+    total_steps: int,
+    warmup_steps: int,
+    max_lr: float,
+    min_lr: float
+):
+    """
+    根据当前步数计算学习率，包含线性预热和余弦退火。
+    """
+    # 1. 线性预热阶段
+    if step < warmup_steps:
+        return max_lr * step / warmup_steps
+    # 2. 超过总步数，返回最小学习率
+    if step > total_steps:
+        return min_lr
+    # 3. 余弦退火阶段
+    decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
+    assert 0.0 <= decay_ratio <= 1.0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 # --- 1. 配置与模型定义 (Configuration and Model Definition) ---
 # 注意: create_model 函数现在从 model.py 导入
 
@@ -289,6 +313,12 @@ def train(
     blend_bp_gradient=False,
     instruct_cosine_target=DEFAULT_INSTRUCT_COSINE_TARGET,
     instruct_noise_scale=DEFAULT_INSTRUCT_NOISE_SCALE,
+    # 新增LR调度器参数
+    use_lr_scheduler=False,
+    warmup_steps=300,
+    min_lr=1e-6,
+    # 新增梯度累积参数
+    gradient_accumulation_steps=1,
 ):
     """主训练函数"""
     
@@ -339,7 +369,7 @@ def train(
 
     if logger:
         logger.info(
-            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_bp_gradient=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s",
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_bp_gradient=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s use_lr_scheduler=%s warmup_steps=%s min_lr=%s",
             run_name or "unnamed",
             mode,
             scope,
@@ -347,6 +377,8 @@ def train(
             lr,
             epochs,
             batch_size,
+            gradient_accumulation_steps,
+            batch_size * gradient_accumulation_steps,
             block_size,
             optimizer_type,
             bp_interval,
@@ -359,6 +391,9 @@ def train(
             max_samples,
             bp_dataset_name or "same_as_main",
             bp_max_samples or "default",
+            use_lr_scheduler,
+            warmup_steps if use_lr_scheduler else 'N/A',
+            min_lr if use_lr_scheduler else 'N/A',
         )
     
     # 确定可训练参数
@@ -476,8 +511,11 @@ def train(
                 'mode',
                 'scope',
                 'q',
-                'lr',
+                'initial_lr',
+                'current_lr',
                 'batch_size',
+                'gradient_accumulation_steps',
+                'effective_batch_size',
                 'optimizer',
                 'bp_interval',
                 'loss',
@@ -487,42 +525,106 @@ def train(
     # 开始训练
     model.train()
     step = 0
+    # 计算总优化步数（考虑梯度累积）
+    batches_per_epoch = len(dataloader)
+    total_optimization_steps = (batches_per_epoch * epochs) // gradient_accumulation_steps
+    total_steps = total_optimization_steps  # 用于LR调度器
+    
     last_metrics = {
         'loss': None,
         'grad_norm': None,
         'epoch': None,
         'step': None,
     }
+    
+    # 梯度累积计数器
+    accumulation_counter = 0
+    accumulated_loss = 0.0
+    
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         if logger:
             logger.info("Epoch %s/%s started", epoch + 1, epochs)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            # --- 学习率计算 ---
+            if use_lr_scheduler:
+                current_lr = get_cosine_schedule_with_warmup(
+                    step=step,
+                    total_steps=total_steps,
+                    warmup_steps=warmup_steps,
+                    max_lr=lr,  # args.learning_rate 作为最大学习率
+                    min_lr=min_lr,
+                )
+                # 动态更新优化器内的学习率
+                if optimizer is not None:
+                    if hasattr(optimizer, 'param_groups'):
+                        # PyTorch 标准优化器
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = current_lr
+                    elif hasattr(optimizer, 'lr'):
+                        # 自定义优化器（CustomAdamOptimizer, MuDaMWOptimizer）
+                        optimizer.lr = current_lr
+            else:
+                current_lr = lr # 如果不使用调度器，则保持固定学习率
+
             inputs = batch.to(device)
             labels = inputs.clone()
 
             grad_norm = 0.0  # 默认值
             
             if mode == 'FO':
-                if hasattr(optimizer, 'zero_grad'):
-                    optimizer.zero_grad()
+                # FO模式：支持梯度累积
                 logits = model(inputs).logits
                 # Shift logits and labels for next-token prediction
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                loss.backward()
                 
-                # 计算梯度范数（用于记录）
-                grad_norm_sq = 0.0
-                for p in trainable_params:
-                    if p.grad is not None:
-                        grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
-                grad_norm = math.sqrt(grad_norm_sq)
+                # 梯度累积：损失除以累积步数以保持梯度尺度
+                scaled_loss = loss / gradient_accumulation_steps
+                scaled_loss.backward()
                 
-                optimizer.step()
+                # 累积损失（用于记录）
+                accumulated_loss += loss.item()
+                accumulation_counter += 1
+                
+                # 只在累积到指定步数时才更新参数
+                should_update = (accumulation_counter >= gradient_accumulation_steps)
+                
+                if should_update:
+                    # 计算梯度范数（用于记录）
+                    grad_norm_sq = 0.0
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
+                    grad_norm = math.sqrt(grad_norm_sq)
+                    
+                    # 更新参数
+                    optimizer.step()
+                    
+                    # 清零梯度
+                    if hasattr(optimizer, 'zero_grad'):
+                        optimizer.zero_grad()
+                    else:
+                        for p in trainable_params:
+                            if p.grad is not None:
+                                p.grad.zero_()
+                    
+                    # 计算平均损失
+                    loss = torch.tensor(accumulated_loss / accumulation_counter)
+                    
+                    # 重置累积计数器
+                    accumulation_counter = 0
+                    accumulated_loss = 0.0
+                    
+                    # 增加优化步数
+                    step += 1
+                else:
+                    # 如果还在累积阶段，跳过日志记录和checkpoint
+                    continue
             
             elif mode in zo_like_modes:
+                # ZO模式：每个batch都是一次优化步骤
                 should_use_bp = (
                     mode in {'Calibrate', 'Instruct'}
                     and bp_interval is not None
@@ -573,10 +675,6 @@ def train(
 
                 # 在Calibrate模式下使用BP梯度
                 if mode == 'Calibrate' and should_use_bp and bp_grads is not None:
-                    # grad_paramwise = [
-                        # 0.5 * (gz + gb)
-                        # for gz, gb in zip(grad_paramwise, bp_grads)
-                    # ]
                     grad_paramwise = bp_grads
                 
                 # 在Instruct模式下，可选择混合BP和ZO梯度
@@ -592,13 +690,17 @@ def train(
                         grad_norm_sq += float(torch.sum(g.detach() * g.detach()).item())
                 grad_norm = math.sqrt(grad_norm_sq)
 
-                if optimizer is None:
+                if optimizer is None: # 手动 SGD 更新
                     for p, g in zip(trainable_params, grad_paramwise):
                         if g is None:
                             continue
-                        p.data -= lr * g
-                else:
+                        p.data -= current_lr * g # 使用动态学习率
+                else: # 使用 Adam 或 MuDaMW
+                    # 优化器的学习率已在循环开始时更新
                     optimizer.step(grads=grad_paramwise)
+                
+                # ZO模式：每个batch后增加step
+                step += 1
 
             losses.append(loss.item())
             current_step = step
@@ -627,8 +729,11 @@ def train(
                             mode,
                             scope,
                             row_q,
-                            lr,
+                            lr, # 初始最大学习率
+                            current_lr, # 当前学习率
                             batch_size,
+                            gradient_accumulation_steps if mode == 'FO' else 1,
+                            batch_size * (gradient_accumulation_steps if mode == 'FO' else 1),
                             optimizer_type,
                             row_bp_interval,
                             loss.item(),
@@ -637,11 +742,12 @@ def train(
 
                 if logger:
                     logger.info(
-                        "step=%s epoch=%s loss=%.6f grad_norm=%.6f mode=%s scope=%s q=%s bp_interval=%s",
+                        "step=%s epoch=%s loss=%.6f grad_norm=%.6f lr=%.6e mode=%s scope=%s q=%s bp_interval=%s",
                         current_step,
                         epoch + 1,
                         loss.item(),
                         grad_norm,
+                        current_lr,
                         mode,
                         scope,
                         row_q,
@@ -661,8 +767,11 @@ def train(
                         'epoch': epoch + 1,
                         'step': current_step,
                         'q': q if mode in zo_like_modes else None,
-                        'learning_rate': lr,
+                        'learning_rate': lr, # 初始最大学习率
+                        'current_learning_rate': current_lr, # 当前学习率
                         'batch_size': batch_size,
+                        'gradient_accumulation_steps': gradient_accumulation_steps if mode == 'FO' else 1,
+                        'effective_batch_size': batch_size * (gradient_accumulation_steps if mode == 'FO' else 1),
                         'optimizer': optimizer_type,
                         'bp_interval': bp_interval if mode in {'Calibrate', 'Instruct'} else None,
                         'loss': float(loss.item()),
@@ -673,6 +782,9 @@ def train(
                         'checkpoint_type': 'periodic',
                         'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
                         'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
+                        'use_lr_scheduler': use_lr_scheduler,
+                        'warmup_steps': warmup_steps if use_lr_scheduler else None,
+                        'min_lr': min_lr if use_lr_scheduler else None,
                     }
                     save_latest_checkpoint(
                         model,
@@ -685,6 +797,7 @@ def train(
             
             postfix = {
                 "loss": f"{loss.item():.4f}",
+                "lr": f"{current_lr:.2e}", # 在进度条中显示当前学习率
                 "grad_norm": f"{grad_norm:.4f}",
                 "opt": optimizer_type
             }
@@ -694,8 +807,6 @@ def train(
                     postfix["bp_int"] = bp_interval
 
             pbar.set_postfix(postfix)
-            
-            step += 1
         if logger:
             logger.info("Epoch %s/%s completed", epoch + 1, epochs)
 
@@ -713,6 +824,8 @@ def train(
             'q': q if mode in zo_like_modes else None,
             'learning_rate': lr,
             'batch_size': batch_size,
+            'gradient_accumulation_steps': gradient_accumulation_steps if mode == 'FO' else 1,
+            'effective_batch_size': batch_size * (gradient_accumulation_steps if mode == 'FO' else 1),
             'optimizer': optimizer_type,
             'bp_interval': bp_interval if mode in {'Calibrate', 'Instruct'} else None,
             'loss': last_metrics['loss'],
@@ -723,6 +836,9 @@ def train(
             'checkpoint_type': 'final',
             'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
             'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
+            'use_lr_scheduler': use_lr_scheduler,
+            'warmup_steps': warmup_steps if use_lr_scheduler else None,
+            'min_lr': min_lr if use_lr_scheduler else None,
         }
         save_latest_checkpoint(
             model,
@@ -741,9 +857,10 @@ def train(
     plt.plot(losses)
     q_text = q if mode in zo_like_modes else 'N/A'
     bp_text = bp_interval if mode in {'Calibrate', 'Instruct'} else 'N/A'
+    scheduler_text = f"Scheduler(warmup={warmup_steps})" if use_lr_scheduler else "Fixed LR"
     plt.title(
         f'Training Loss Curve\nMode={mode}, Scope={scope}, q={q_text}, BP-Interval={bp_text}, '
-        f'LR={lr}, Optimizer={optimizer_type.upper()}'
+        f'LR={lr}, Optimizer={optimizer_type.upper()}, {scheduler_text}'
     )
     plt.xlabel('Training Steps')
     plt.ylabel('Cross-Entropy Loss')
@@ -759,9 +876,11 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, required=True, choices=['FO', 'ZO', 'Calibrate', 'Instruct'], help="Optimization mode.")
     parser.add_argument("--scope", type=str, default='reduced', choices=['full', 'reduced'], help="Training scope: 'full' model or 'reduced' (last layer only).")
     parser.add_argument("--query_budget_q", type=int, default=1, help="Query budget (q) for ZO. Number of random directions.")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate (acts as max_lr if scheduler is used).")
     parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of gradient accumulation steps (only for FO mode). Effective batch size = batch_size * gradient_accumulation_steps.")
     parser.add_argument("--optimizer", type=str, default='sgd', choices=['sgd', 'adam', 'mudamw'], 
                         help="Optimizer type: SGD (vanilla), Adam, or MuDaMW.")
     parser.add_argument("--csv_file", type=str, default=None, help="CSV file to save training logs.")
@@ -807,6 +926,14 @@ if __name__ == "__main__":
                         help="Target cosine similarity for hybrid instruct direction generation.")
     parser.add_argument("--instruct_noise_scale", type=float, default=DEFAULT_INSTRUCT_NOISE_SCALE,
                         help="Noise scale for hybrid instruct direction generation.")
+
+    # 新增：学习率调度器参数
+    parser.add_argument("--use_lr_scheduler", action="store_true",
+                        help="Enable cosine learning rate scheduler with warmup.")
+    parser.add_argument("--warmup_steps", type=int, default=300,
+                        help="Number of warmup steps for the LR scheduler.")
+    parser.add_argument("--min_lr", type=float, default=1e-6,
+                        help="Minimum learning rate for cosine annealing.")
     
     args = parser.parse_args()
 
@@ -900,6 +1027,12 @@ if __name__ == "__main__":
         blend_bp_gradient=args.blend_bp_gradient,
         instruct_cosine_target=args.instruct_cosine_target,
         instruct_noise_scale=args.instruct_noise_scale,
+        # 传递调度器参数
+        use_lr_scheduler=args.use_lr_scheduler,
+        warmup_steps=args.warmup_steps,
+        min_lr=args.min_lr,
+        # 传递梯度累积参数
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     print(f"CSV metrics saved to {csv_file_path}")
