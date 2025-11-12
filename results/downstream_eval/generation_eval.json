@@ -1,8 +1,8 @@
 {
-  "timestamp": "2025-11-07T18:36:58.758910",
+  "timestamp": "2025-11-12T12:44:38.481862",
   "config": {
     "task": "generation",
-    "checkpoint_path": "/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251106_203047/experiments/Instruct_200M_full_bs2_q64_bp1_optmudamw_lr1e-3/logs/parallel_sweep_20251106_203047/experiments/Instruct_200M_full_bs2_q64_bp1_optmudamw_lr1e-3/checkpoint",
+    "checkpoint_path": "/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251112_000045/experiments/FO_500M_full_bs4_blk512_qN_A_bpN_A_optmudamw_lr1e-3/logs/parallel_sweep_20251112_000045/experiments/FO_500M_full_bs4_blk512_qN_A_bpN_A_optmudamw_lr1e-3/checkpoint",
     "baseline_checkpoint": null,
     "compare_from_scratch": false,
     "model_size": "200M",
@@ -31,23 +31,23 @@
       ],
       "generations": [
         [
-          "Hello, how are you? That's that I had had a trip to take in my journey – all to enjoy our respective journeys. That's explore how they know that everyone had a crucial facet of the \"What’t no extraordinary culture, and I needed. She started remember that had been the realm of a unique to embrace this unit, they can delve deeper into the role in the process",
-          "Hello, how are you? Well, these platforms like a trip to understand our comprehension of their own journeys, ultimately and you're a culture.\n\nFirstly, we don't go from those who need that sometimes you know that sometimes let's explore the world about the same friends. For instance, the way to navigate the same time of the importance of the property of the process. Furthermore, he",
-          "Hello, how are you?\n\n\nAs you're the beauty, let us remember, while also get no another so exactly so you find him in a more than ever might just about a closer you're trying to find yourself down to take one can take something how our thoughts and explore how she can greatly be searching for growth.\n\nOf course, you can greatly now to enjoy the equation"
+          "Hello, how are you?\nThe most important factor is to maintain your health care. Some people will have to wait until they start to stay active and maintain healthy bones.\nIn addition, you may also take a few minutes to take a walk to the next day.\n- Being active and active during this day, you can’t have to walk or walk.\n- Being active",
+          "Hello, how are you? If you have an information about your child’s life and your child, please contact the health specialist.\n- Help children learn about their health care and how to tell them about their health.\n- If your child has a child, the health professional can help with the help of your child’s health care team.\n- If you are experiencing your",
+          "Hello, how are you?\nWe will be able to see that if you have had a chance to recover the damage that could be related to our actions.\nWe will use our own methods to determine the cause of this?\nWe will also explore the cause of the disaster (and, if you are not sure, you will be able to view it as a disaster), which will involve the"
         ],
         [
-          "What is AI?\n\n****\n\nA. **C. **I-on:******::**:\n\nA. **1.\n2. **B. Real-free-free-1. Introduction\nA. **The role in Japan\nA. **A. Understanding the team is always the property to focus on their target than just a. As",
-          "What is AI? Let's explore how to cover the world of the process of the number of the center of the most convenient.\n\nAnother important information, where he a small. Understanding and consider some of the original area of the beauty of the time, and other years about the most new world of his own time. However, I and his own beauty of his own relationships and explore my next",
-          "What is AI? Let us dive deep into that a closer look at any unique world of our attention to ensure that your respective relationships with a positive example of those who can appreciate the unique, and and transformation.\n\nConclusion:\n1. One example, the concept of the Art, the time to shape the process of the process to note that the same piece of the same area of the following"
+          "What is AI?\nMany people who are addicted to AI are addicted to the drug. They tend to be addicted to the drug, but they may take the drugs to become addicted to it.\nWhat is AI?\nTo learn more about AI?\nWhen a dopamine is a dopamine, they may be addicted to the drug.\nWhat is AI?\nA dopamine is a dopamine.\n",
+          "What is AI?\nA key element of AI is that it can be used to determine how the data is used to change the data. AI is also described as a “experimental” for example, since the data is collected in a database in the database, and can be used to identify the data.\nWhy is AI?\nThe Internet is a computer, which is used for",
+          "What is AI?\nThe basic role of AI is to be able to communicate and express the structure of the brain and to express a set of points of the brain. These include:\n- Vision of the brain, to regulate the normal functioning of the brain and its natural environment.\n- Brain changes that allow AI to interact with other parts of the brain, including the brain, the development of"
         ],
         [
-          "Once upon a time in the following a central role of the same.\n\nAnother important factor involves the United States, the world is a result in the power of the game of the central issue of the property, which is a more than the same step, and the film. The Art of the region, we can greatly be created in the process. However, the same example of various and focus",
-          "Once upon a time. They also involves the very first, I had discovered the very work, I had my own love and I realized the importance of her unique.\n\nMoreover, I discovered her love.\n\nAs he believed that the beauty of the way and camaraderie moved to join me the “You decided to explore how they were came by being confident.” I",
-          "Once upon a time, and commitment to shape-term strategies and engaging in mind that the form, these principles.\n\n1. Explanation of the web platforms enable careful consideration of the role in shaping this concept of the field.\n\nA. The time, we will delve into the importance of the importance of others and challenges regarding the role in the community.\n\nA. The following"
+          "Once upon a time, you can be a little better off-the-shelf.\nWhen you are trying to lose a good deal of money, your business has been in place, and you have to be able to sell a financial base. You can purchase it for a period where you are ready to buy a loan.\nSo much money can pay you cash.\nThis may be a",
+          "Once upon a time, the British had only had to have had an hour for the purpose of being the first man to do so. It was a much-known thing that took place in London and Wales.\nThe American Revolution of America was one of the most influential societies of America to the present day. The American Revolution was created in 1914 and was the first European settlement of the British Empire.",
+          "Once upon a time, they would be unable to lose their lives. Once they're able to find a way to cope with one another, they would not want to happen.\nBut this would be one of the most important of the time people and society have given the opportunity to understand their behavior.\nWhat is our behavior?\nWhat is our attitude of being?\nOur interpersonal behaviors will have"
         ]
       ],
       "model_info": {
-        "num_parameters": 124440576
+        "num_parameters": 354824192
       }
     }
   }

@@ -285,6 +285,22 @@ def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
 
     return loss.detach(), grads
 
+# --- 辅助函数：OOM 检测 (Helper) ---
+def _is_out_of_memory_error(err: Exception) -> bool:
+    """
+    检测异常是否由CUDA显存不足引起。
+    """
+    if isinstance(err, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(err).lower()
+    if "out of memory" in message:
+        return True
+    if "cuda error" in message and "out of memory" in message:
+        return True
+    if "cublas" in message and "alloc" in message:
+        return True
+    return False
+
 # --- 4. 训练循环 (Training Loops) ---
 
 def train(
@@ -310,7 +326,7 @@ def train(
     run_name=None,
     bp_dataset_name=None,
     bp_max_samples=None,
-    blend_bp_gradient=False,
+    blend_ratio=0.0,
     instruct_cosine_target=DEFAULT_INSTRUCT_COSINE_TARGET,
     instruct_noise_scale=DEFAULT_INSTRUCT_NOISE_SCALE,
     # 新增LR调度器参数
@@ -369,7 +385,7 @@ def train(
 
     if logger:
         logger.info(
-            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_bp_gradient=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s use_lr_scheduler=%s warmup_steps=%s min_lr=%s",
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_ratio=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s use_lr_scheduler=%s warmup_steps=%s min_lr=%s",
             run_name or "unnamed",
             mode,
             scope,
@@ -382,7 +398,7 @@ def train(
             block_size,
             optimizer_type,
             bp_interval,
-            blend_bp_gradient,
+            blend_ratio,
             instruct_cosine_target,
             instruct_noise_scale,
             device,
@@ -540,7 +556,8 @@ def train(
     # 梯度累积计数器
     accumulation_counter = 0
     accumulated_loss = 0.0
-    
+    fo_micro_batch_size_hint = batch_size if mode == 'FO' else None
+
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         if logger:
@@ -573,54 +590,133 @@ def train(
             grad_norm = 0.0  # 默认值
             
             if mode == 'FO':
-                # FO模式：支持梯度累积
-                logits = model(inputs).logits
-                # Shift logits and labels for next-token prediction
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                
-                # 梯度累积：损失除以累积步数以保持梯度尺度
-                scaled_loss = loss / gradient_accumulation_steps
-                scaled_loss.backward()
-                
-                # 累积损失（用于记录）
-                accumulated_loss += loss.item()
-                accumulation_counter += 1
-                
-                # 只在累积到指定步数时才更新参数
+                total_batch_size = inputs.size(0)
+                previous_hint = fo_micro_batch_size_hint if fo_micro_batch_size_hint is not None else total_batch_size
+                micro_batch_size = min(total_batch_size, previous_hint)
+                last_oom_error = None
+                fo_success = False
+
+                while micro_batch_size >= 1:
+                    try:
+                        grad_contrib = [torch.zeros_like(p) for p in trainable_params]
+                        total_loss_weighted = 0.0
+                        total_token_count = 0
+
+                        for start in range(0, total_batch_size, micro_batch_size):
+                            end = min(start + micro_batch_size, total_batch_size)
+                            chunk_inputs = inputs[start:end]
+                            chunk_labels = labels[start:end]
+
+                            logits = model(chunk_inputs).logits
+                            shift_logits = logits[..., :-1, :].contiguous()
+                            shift_labels = chunk_labels[..., 1:].contiguous()
+                            loss_chunk = loss_fn(
+                                shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_labels.view(-1)
+                            )
+
+                            grads_chunk = torch.autograd.grad(
+                                loss_chunk,
+                                trainable_params,
+                                retain_graph=False,
+                                create_graph=False,
+                                allow_unused=True,
+                            )
+
+                            chunk_size = chunk_inputs.size(0)
+                            chunk_weight = chunk_size / float(total_batch_size)
+                            for gi, g in enumerate(grads_chunk):
+                                if g is None:
+                                    continue
+                                grad_contrib[gi].add_(g.detach() * (chunk_weight / gradient_accumulation_steps))
+
+                            token_count = shift_labels.numel()
+                            total_loss_weighted += loss_chunk.item() * token_count
+                            total_token_count += token_count
+
+                        average_loss = total_loss_weighted / max(total_token_count, 1)
+
+                        for p, g in zip(trainable_params, grad_contrib):
+                            if g is None:
+                                continue
+                            if p.grad is None:
+                                p.grad = g.detach().clone()
+                            else:
+                                p.grad.add_(g.detach())
+
+                        accumulation_counter += 1
+                        accumulated_loss += average_loss
+                        loss = torch.tensor(average_loss, device=device)
+                        fo_success = True
+                        break
+
+                    except RuntimeError as err:
+                        if not _is_out_of_memory_error(err):
+                            raise
+                        last_oom_error = err
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                        next_micro = micro_batch_size // 2
+                        if next_micro < 1 and micro_batch_size > 1:
+                            next_micro = 1
+                        if next_micro < 1:
+                            break
+
+                        if logger:
+                            logger.warning(
+                                "CUDA OOM at micro batch size %s; retrying with %s (effective batch size=%s).",
+                                micro_batch_size,
+                                next_micro,
+                                total_batch_size,
+                            )
+                        else:
+                            print(f"⚠️  CUDA OOM at micro batch size {micro_batch_size}, retrying with {next_micro}.")
+
+                        micro_batch_size = next_micro
+                        continue
+
+                if not fo_success:
+                    raise last_oom_error if last_oom_error is not None else RuntimeError("Failed to process FO batch due to OOM.")
+
+                micro_chunks_used = math.ceil(total_batch_size / micro_batch_size)
+                if fo_micro_batch_size_hint is None or micro_batch_size < fo_micro_batch_size_hint:
+                    if micro_chunks_used > 1:
+                        fallback_msg = (
+                            f"FO micro-batch fallback: effective batch={total_batch_size}, "
+                            f"micro batch={micro_batch_size}, chunks={micro_chunks_used}"
+                        )
+                        if logger:
+                            logger.info(fallback_msg)
+                        else:
+                            print(f"ℹ️  {fallback_msg}")
+
+                fo_micro_batch_size_hint = micro_batch_size
                 should_update = (accumulation_counter >= gradient_accumulation_steps)
-                
+
                 if should_update:
-                    # 计算梯度范数（用于记录）
                     grad_norm_sq = 0.0
                     for p in trainable_params:
                         if p.grad is not None:
                             grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
                     grad_norm = math.sqrt(grad_norm_sq)
-                    
-                    # 更新参数
+
                     optimizer.step()
-                    
-                    # 清零梯度
+
                     if hasattr(optimizer, 'zero_grad'):
                         optimizer.zero_grad()
                     else:
                         for p in trainable_params:
                             if p.grad is not None:
                                 p.grad.zero_()
-                    
-                    # 计算平均损失
-                    loss = torch.tensor(accumulated_loss / accumulation_counter)
-                    
-                    # 重置累积计数器
+
+                    loss = torch.tensor(accumulated_loss / accumulation_counter, device=device)
+
                     accumulation_counter = 0
                     accumulated_loss = 0.0
-                    
-                    # 增加优化步数
+
                     step += 1
                 else:
-                    # 如果还在累积阶段，跳过日志记录和checkpoint
                     continue
             
             elif mode in zo_like_modes:
@@ -678,9 +774,10 @@ def train(
                     grad_paramwise = bp_grads
                 
                 # 在Instruct模式下，可选择混合BP和ZO梯度
-                if mode == 'Instruct' and blend_bp_gradient and should_use_bp and bp_grads is not None:
+                # blend_ratio: 0=纯ZO, 1=纯BP, 0.5=均等混合
+                if mode == 'Instruct' and blend_ratio > 0 and should_use_bp and bp_grads is not None:
                     grad_paramwise = [
-                        0.5 * (gz + gb)
+                        (1 - blend_ratio) * gz + blend_ratio * gb
                         for gz, gb in zip(grad_paramwise, bp_grads)
                     ]
 
@@ -920,8 +1017,8 @@ if __name__ == "__main__":
                         help="Maximum number of samples to use from BP dataset. None=use recommended value.")
     
     # 梯度混合参数（用于Instruct模式）
-    parser.add_argument("--blend_bp_gradient", action="store_true", default=True,
-                        help="In Instruct mode, blend BP gradient with ZO gradient (average of both). Only effective when bp_interval > 0.")
+    parser.add_argument("--blend_ratio", type=float, default=0.0,
+                        help="In Instruct mode, blend ratio for BP and ZO gradients. 0.0=pure ZO, 1.0=pure BP, 0.5=equal blend. Only effective when bp_interval > 0.")
     parser.add_argument("--instruct_cosine_target", type=float, default=DEFAULT_INSTRUCT_COSINE_TARGET,
                         help="Target cosine similarity for hybrid instruct direction generation.")
     parser.add_argument("--instruct_noise_scale", type=float, default=DEFAULT_INSTRUCT_NOISE_SCALE,
@@ -1024,7 +1121,7 @@ if __name__ == "__main__":
         run_name=run_name,
         bp_dataset_name=args.bp_dataset,
         bp_max_samples=args.bp_max_samples,
-        blend_bp_gradient=args.blend_bp_gradient,
+        blend_ratio=args.blend_ratio,
         instruct_cosine_target=args.instruct_cosine_target,
         instruct_noise_scale=args.instruct_noise_scale,
         # 传递调度器参数
