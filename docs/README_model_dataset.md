@@ -187,7 +187,7 @@ python reproduce_zo_paper.py \
 
 数据集会自动缓存到 `cache/` 目录，缓存文件名格式为:
 ```
-dataset_{dataset_name}_bs{block_size}_samples{max_samples}.pkl
+dataset_{dataset_name}_blk{block_size}_samples{max_samples}.pkl
 ```
 
 如果需要强制重新加载数据集，可以删除相应的缓存文件。
@@ -248,6 +248,7 @@ dataset_{dataset_name}_bs{block_size}_samples{max_samples}.pkl
 **解决方案**:
 - 检查网络连接 (需要访问 HuggingFace Hub)
 - 删除缓存文件重新下载: `rm cache/dataset_*.pkl`
+- 注意：不同的 batch_size 会共用同一个 pkl 文件（pkl 只与 block_size 和 max_samples 相关）
 - 尝试使用流式加载的数据集
 
 ### 问题 3: 训练速度慢

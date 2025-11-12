@@ -196,7 +196,7 @@ DATASET_CONFIGS = {
         'text_field': 'text',
         'streaming': True,
         'description': 'FineWeb-Edu 10BT采样，适合快速实验的高质量教育数据',
-        'recommended_samples': 30000,
+        'recommended_samples': 30000, #maximum 1.53B
         'language': 'en',
         'size': '~10B tokens',
         'dataset_name': 'sample-10BT',
@@ -256,8 +256,9 @@ def get_dataloader(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(exist_ok=True)
     
-    # 创建缓存文件名
-    cache_file = cache_dir / f"dataset_{dataset_name}_bs{block_size}_samples{max_samples}.pkl"
+    # 创建缓存文件名（使用 blk 表示 block_size，避免与 batch_size 混淆）
+    # 注意：不同的 batch_size 共用同一个 pkl 文件
+    cache_file = cache_dir / f"dataset_{dataset_name}_blk{block_size}_samples{max_samples}.pkl"
     
     # 检查缓存
     if not force_reload and cache_file.exists():
@@ -265,6 +266,7 @@ def get_dataloader(
         with open(cache_file, 'rb') as f:
             examples = pickle.load(f)
         print(f"Dataset loaded from cache. Total samples: {len(examples)}")
+        print(f"Creating DataLoader with batch_size={batch_size}")
         return DataLoader(examples, batch_size=batch_size, shuffle=True)
     
     # 加载数据集

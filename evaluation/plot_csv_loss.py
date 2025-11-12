@@ -179,7 +179,7 @@ def plot_series(
     plt.figure(figsize=(14, 7))
     
     for label, (steps, losses) in sorted(series.items()):
-        if label.startswith('FO'):
+        if label.startswith('FO') or label.startswith('ZO'):
             steps = 4 * np.array(steps)
         plt.plot(steps, losses, label=label, linewidth=1.5, alpha=0.8)
 

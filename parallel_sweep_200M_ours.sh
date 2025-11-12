@@ -23,16 +23,17 @@ CLEANUP_DONE=false
 # 默认配置参数
 MODES=("Instruct") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
-BATCH_SIZES=(4)
+BATCH_SIZES=(4) # ！！不可以调大！！
+GRADIENT_ACCUMULATION_STEPS=8  # 梯度累积步数，1表示不使用梯度累积
 BLOCK_SIZES=(512)  # 序列长度 (可选: 64, 128, 256, 512, 1024)
 QUERY_BUDGETS=(8)
 BP_INTERVALS=(1)
-BLEND_RATIOS=(0.2 0.4 0.6 0.8)  # Instruct模式梯度混合比例: 0.0=纯ZO, 1.0=纯BP, 0.5=均等混合
+BLEND_RATIOS=(0.1 0.2 0.5 0.9)  # Instruct模式梯度混合比例: 0.0=纯ZO, 1.0=纯BP, 0.5=均等混合
 INSTRUCT_COSINE_TARGETS=(0.01)
 INSTRUCT_NOISE_SCALES=(10.0)
 LEARNING_RATES_ZO=(1e-3)
 OPTIMIZERS=("mudamw")  # 可选: sgd, adam, mudamw
-EPOCHS=10
+EPOCHS=1
 LOG_INTERVAL=10
 
 # 学习率调度器配置 (Learning Rate Scheduler Configuration)
@@ -42,13 +43,17 @@ MIN_LR=1e-6           # 最小学习率
 
 # 梯度累积配置 (Gradient Accumulation Configuration)
 # 仅适用于FO模式。有效batch size = batch_size * gradient_accumulation_steps
-GRADIENT_ACCUMULATION_STEPS=8  # 梯度累积步数，1表示不使用梯度累积
+
+# ZO并行计算配置 (ZO Parallel Computation Configuration)
+# 仅适用于ZO、Calibrate、Instruct模式
+USE_PARALLEL_Q_COMPUTATION=false  # 是否启用并行Q值计算（内存优化）
+PARALLEL_BATCH_SIZE=4             # 并行计算时的批次大小
 
 LOGS_ROOT="logs"
 
 # 模型配置 (Model Configuration)
 # 备选: 20M (超小型，快速实验), 200M (中小型，类似GPT-2 Small), 500M (中型), 1B (大型)
-MODEL_SIZES=("20M" "200M")  # 默认使用200M模型，可以是数组如: ("20M" "200M" "500M" "1B")
+MODEL_SIZES=("200M")  # 默认使用200M模型，可以是数组如: ("20M" "200M" "500M" "1B")
 
 # 数据集配置 (Dataset Configuration)
 # 备选数据集:
@@ -69,17 +74,17 @@ DATASET="fineweb-edu-10bt"  # 默认使用cosmopedia-100k (快速测试推荐fin
 # 建议值参考:
 #   cosmopedia-100k(20000), cosmopedia(100000), openwebtext(50000), c4(100000)
 #   fineweb(100000), fineweb-edu(50000), fineweb-edu-10bt(30000)
-MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字如: 20000
+MAX_SAMPLES="1000000"  # 留空使用推荐值，或指定具体数字如: 20000
 
 # BP数据集配置 (BP Dataset Configuration for Calibrate/Instruct modes)
 # 用于Calibrate/Instruct模式中BP梯度计算的数据集
 # 留空表示使用与主训练相同的数据集
-BP_DATASET="fineweb-edu-10bt"  # 留空使用主数据集，或指定不同的数据集如: "cosmopedia-100k"
+BP_DATASET=""  # 留空使用主数据集，或指定不同的数据集如: "cosmopedia-100k"
 BP_MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字
 
 # 并行配置
 MAX_PARALLEL_JOBS=32 # 最大并行任务数
-GPU_IDS="4,5,6,7"           # GPU ID列表，空表示自动检测
+GPU_IDS="4"           # GPU ID列表，空表示自动检测
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -184,6 +189,18 @@ while [[ $# -gt 0 ]]; do
             GRADIENT_ACCUMULATION_STEPS="$2"
             shift 2
             ;;
+        --parallel-q-computation)
+            USE_PARALLEL_Q_COMPUTATION=true
+            shift 1
+            ;;
+        --no-parallel-q-computation)
+            USE_PARALLEL_Q_COMPUTATION=false
+            shift 1
+            ;;
+        --parallel-batch-size)
+            PARALLEL_BATCH_SIZE="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo "Options:"
@@ -218,6 +235,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --min-lr VALUE       最小学习率 (默认: 1e-6)"
             echo "  --gradient-accumulation-steps N  梯度累积步数 (仅FO模式, 默认: 1)"
             echo "                       有效batch size = batch_size * gradient_accumulation_steps"
+            echo "  --parallel-q-computation          启用并行Q值计算 (仅ZO/Calibrate/Instruct模式, 默认: 禁用)"
+            echo "  --no-parallel-q-computation      禁用并行Q值计算"
+            echo "  --parallel-batch-size N          并行Q值计算的批次大小 (默认: 4)"
             echo "  -h, --help           显示帮助信息"
             exit 0
             ;;
@@ -511,6 +531,14 @@ run_single_experiment() {
     # 梯度累积参数（仅FO模式）
     if [ "$mode" = "FO" ] && [ "$GRADIENT_ACCUMULATION_STEPS" -gt 1 ]; then
         cmd="$cmd --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS"
+    fi
+    
+    # ZO并行计算参数（仅ZO/Calibrate/Instruct模式）
+    if [[ "$mode" == "ZO" || "$mode" == "Calibrate" || "$mode" == "Instruct" ]]; then
+        if [ "$USE_PARALLEL_Q_COMPUTATION" = true ]; then
+            cmd="$cmd --parallel_q_computation"
+        fi
+        cmd="$cmd --parallel_batch_size $PARALLEL_BATCH_SIZE"
     fi
     
     # 设置GPU环境变量
@@ -808,6 +836,8 @@ main() {
     echo "BP_MAX_SAMPLES: ${BP_MAX_SAMPLES:-auto}" >> "$LOG_FILE"
     echo "INSTRUCT_COSINE_TARGETS: ${INSTRUCT_COSINE_TARGETS[*]}" >> "$LOG_FILE"
     echo "INSTRUCT_NOISE_SCALES: ${INSTRUCT_NOISE_SCALES[*]}" >> "$LOG_FILE"
+    echo "USE_PARALLEL_Q_COMPUTATION: ${USE_PARALLEL_Q_COMPUTATION}" >> "$LOG_FILE"
+    echo "PARALLEL_BATCH_SIZE: ${PARALLEL_BATCH_SIZE}" >> "$LOG_FILE"
     echo "MAX_PARALLEL_JOBS: $MAX_PARALLEL_JOBS" >> "$LOG_FILE"
     echo "GPU_IDS: $GPU_IDS" >> "$LOG_FILE"
     echo "=========================================" >> "$LOG_FILE"

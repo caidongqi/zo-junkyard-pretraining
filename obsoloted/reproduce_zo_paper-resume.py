@@ -3,6 +3,10 @@ import csv
 import json
 import logging
 import math
+import os
+import pickle
+import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -10,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.nn import CrossEntropyLoss
 import transformers
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GPT2LMHeadModel
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -21,9 +25,6 @@ from cores.data import get_dataloader
 from cores.optimizer import MuDaMWOptimizer, CustomAdamOptimizer
 
 from cores.generate_instruction import generate_instruct_directions_hybrid
-
-from cores.training_management import CheckpointManager, EvaluationManager
-from cores.instruct_params_manager import InstructParamsManager
 
 # --- 常量配置 (Constants) ---
 
@@ -102,37 +103,14 @@ def zo_gradient_estimator(
     device,
     manual_directions=None,
     data_provider=None,
-    parallel_q_computation=False,
-    parallel_batch_size=4,
 ):
-    """
-    ZO梯度估计器，支持可迭代的手动方向序列，可选地为每个查询提供独立数据。
-    
-    Args:
-        model: 模型
-        trainable_params: 可训练参数列表
-        loss_fn: 损失函数
-        inputs: 输入数据
-        labels: 标签数据
-        q: 查询次数
-        epsilon: 扰动大小
-        device: 设备
-        manual_directions: 手动指定的方向（可选）
-        data_provider: 数据提供器（可选）
-        parallel_q_computation: 是否并行计算Q值（内存优化版本）
-        parallel_batch_size: 并行计算时的批次大小
-    """
+    """ZO梯度估计器，支持可迭代的手动方向序列，可选地为每个查询提供独立数据。"""
     # 关闭dropout，加速且去噪
     was_training = model.training
     model.eval()
 
-    # 内存优化：只备份参数引用，使用in-place恢复
-    original_data = []
-    for p in trainable_params:
-        original_data.append(p.data)
-    
-    # 创建临时存储用于参数恢复（仅在需要时分配）
-    temp_storage = None
+    # 记录可训练参数的原值
+    original = [p.data.clone() for p in trainable_params]
 
     def compute_loss(batch_inputs, batch_labels):
         logits = model(batch_inputs).logits
@@ -151,12 +129,6 @@ def zo_gradient_estimator(
         if batch_labels.device != device:
             batch_labels = batch_labels.to(device)
         return batch_inputs, batch_labels
-    
-    def restore_params():
-        """高效地恢复参数到原始值"""
-        for p, orig in zip(trainable_params, original_data):
-            if p.data is not orig:
-                p.data = orig
 
     # 计算原始参数位置的loss（用于记录）
     batch_inputs, batch_labels = get_batch()
@@ -190,18 +162,16 @@ def zo_gradient_estimator(
 
             batch_inputs, batch_labels = get_batch()
 
-            # 内存优化：使用add_而不是创建新tensor
-            for p, d in zip(trainable_params, direction):
-                p.data.add_(epsilon * d)
+            for p, p0, d in zip(trainable_params, original, direction):
+                p.data = p0 + epsilon * d
             loss_pos = compute_loss(batch_inputs, batch_labels)
 
-            # 恢复并扰动到负方向
-            for p, orig, d in zip(trainable_params, original_data, direction):
-                p.data = orig - epsilon * d
+            for p, p0, d in zip(trainable_params, original, direction):
+                p.data = p0 - epsilon * d
             loss_neg = compute_loss(batch_inputs, batch_labels)
 
-            # 恢复原始参数
-            restore_params()
+            for p, p0 in zip(trainable_params, original):
+                p.data = p0.clone()
 
             proj = (loss_pos - loss_neg) / (2 * epsilon)
             for gi, d in enumerate(direction):
@@ -214,56 +184,43 @@ def zo_gradient_estimator(
     if q is not None:
         remaining_q = max(q - manual_used, 0)
 
-    # 随机方向部分
-    if remaining_q > 0:
-        if parallel_q_computation:
-            # 并行计算版本：批量处理多个方向
-            _compute_random_directions_parallel(
-                trainable_params, original_data, compute_loss, get_batch,
-                remaining_q, epsilon, grads, parallel_batch_size
-            )
-            used_directions += remaining_q
-        else:
-            # 原始顺序版本（内存优化）
-            seeds = []
-            proj_grads = []
-            for _ in range(remaining_q):
-                seed = torch.randint(0, 2**31 - 1, ()).item()
-                seeds.append(seed)
+    # 随机方向部分，继续使用种子以节省显存
+    seeds = []
+    proj_grads = []
+    for _ in range(remaining_q):
+        seed = torch.randint(0, 2**31 - 1, ()).item()
+        seeds.append(seed)
 
-                batch_inputs, batch_labels = get_batch()
+        batch_inputs, batch_labels = get_batch()
 
-                torch.manual_seed(seed)
-                for p, orig in zip(trainable_params, original_data):
-                    z = torch.randn_like(p.data)
-                    p.data = orig + epsilon * z
-                loss_pos = compute_loss(batch_inputs, batch_labels)
+        torch.manual_seed(seed)
+        for p in trainable_params:
+            z = torch.randn_like(p.data)
+            p.data = p.data + epsilon * z
+        loss_pos = compute_loss(batch_inputs, batch_labels)
 
-                torch.manual_seed(seed)
-                for p, orig in zip(trainable_params, original_data):
-                    z = torch.randn_like(p.data)
-                    p.data = orig - epsilon * z
-                loss_neg = compute_loss(batch_inputs, batch_labels)
+        torch.manual_seed(seed)
+        for p, p0 in zip(trainable_params, original):
+            z = torch.randn_like(p.data)
+            p.data = p0 - epsilon * z
+        loss_neg = compute_loss(batch_inputs, batch_labels)
 
-                # 恢复参数
-                restore_params()
+        for p, p0 in zip(trainable_params, original):
+            p.data = p0.clone()
 
-                proj_grads.append(((loss_pos - loss_neg) / (2 * epsilon)).item())
+        proj_grads.append(((loss_pos - loss_neg) / (2 * epsilon)).item())
 
-            # 重建随机方向贡献
-            for seed, proj in zip(seeds, proj_grads):
-                torch.manual_seed(seed)
-                for gi, p in enumerate(trainable_params):
-                    z = torch.randn_like(p.data)
-                    grads[gi].add_(proj * z)
-                used_directions += 1
+    # 重建随机方向贡献
+    for seed, proj in zip(seeds, proj_grads):
+        torch.manual_seed(seed)
+        for gi, p in enumerate(trainable_params):
+            z = torch.randn_like(p.data)
+            grads[gi].add_(proj * z)
+        used_directions += 1
 
     if used_directions > 0:
         for gi in range(len(grads)):
             grads[gi].div_(float(used_directions))
-
-    # 确保参数已恢复
-    restore_params()
 
     if was_training:
         model.train()
@@ -271,65 +228,36 @@ def zo_gradient_estimator(
     return grads, base_loss
 
 
-def _compute_random_directions_parallel(
-    trainable_params, original_data, compute_loss, get_batch,
-    num_queries, epsilon, grads, batch_size
+def save_latest_checkpoint(
+    model,
+    tokenizer,
+    checkpoint_dir,
+    optimizer_state=None,
+    metadata=None,
+    logger=None,
 ):
-    """
-    并行计算随机方向的梯度估计（内存优化版本）
-    
-    通过批量处理多个查询来减少重复的模型加载开销。
-    注意：这里的"并行"是指批量处理seeds，而不是真正的多线程，
-    因为模型前向传播仍然是顺序的，但我们可以优化数据流。
-    """
-    seeds = []
-    proj_grads = []
-    
-    # 分批处理查询
-    for batch_start in range(0, num_queries, batch_size):
-        batch_end = min(batch_start + batch_size, num_queries)
-        batch_seeds = []
-        
-        # 生成这一批的seeds
-        for _ in range(batch_start, batch_end):
-            seed = torch.randint(0, 2**31 - 1, ()).item()
-            batch_seeds.append(seed)
-            seeds.append(seed)
-        
-        # 批量计算loss（顺序执行但减少开销）
-        batch_proj_grads = []
-        for seed in batch_seeds:
-            batch_inputs, batch_labels = get_batch()
-            
-            # 正向扰动
-            torch.manual_seed(seed)
-            for p, orig in zip(trainable_params, original_data):
-                z = torch.randn_like(p.data)
-                p.data = orig + epsilon * z
-            loss_pos = compute_loss(batch_inputs, batch_labels)
-            
-            # 负向扰动
-            torch.manual_seed(seed)
-            for p, orig in zip(trainable_params, original_data):
-                z = torch.randn_like(p.data)
-                p.data = orig - epsilon * z
-            loss_neg = compute_loss(batch_inputs, batch_labels)
-            
-            # 恢复参数（为下一次迭代准备）
-            for p, orig in zip(trainable_params, original_data):
-                if p.data is not orig:
-                    p.data = orig
-            
-            proj_grad = ((loss_pos - loss_neg) / (2 * epsilon)).item()
-            batch_proj_grads.append(proj_grad)
-            proj_grads.append(proj_grad)
-    
-    # 重建随机方向贡献
-    for seed, proj in zip(seeds, proj_grads):
-        torch.manual_seed(seed)
-        for gi, p in enumerate(trainable_params):
-            z = torch.randn_like(p.data)
-            grads[gi].add_(proj * z)
+    if not checkpoint_dir:
+        return
+
+    ckpt_path = Path(checkpoint_dir)
+    if ckpt_path.exists():
+        shutil.rmtree(ckpt_path)
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+
+    model.save_pretrained(ckpt_path)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(ckpt_path / "tokenizer")
+
+    if optimizer_state is not None:
+        torch.save(optimizer_state, ckpt_path / "optimizer.pt")
+
+    if metadata is not None:
+        with open(ckpt_path / "training_state.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+    if logger is not None:
+        logger.info("Checkpoint saved to %s", ckpt_path)
+
 
 def compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels):
     """执行一次标准BP，返回loss和每个参数的梯度副本。"""
@@ -394,6 +322,7 @@ def train(
     max_samples=None,
     block_size=128,
     checkpoint_dir=None,
+    resume_from_checkpoint=None,
     logger=None,
     run_name=None,
     bp_dataset_name=None,
@@ -407,24 +336,81 @@ def train(
     min_lr=1e-6,
     # 新增梯度累积参数
     gradient_accumulation_steps=1,
-    # Checkpoint & evaluation management
-    evaluation_results_file=None,
-    evaluation_max_samples=128,
-    evaluation_block_size=256,
-    snapshot_delta=0.5,
-    # ZO优化参数
-    parallel_q_computation=False,
-    parallel_batch_size=4,
 ):
     """主训练函数"""
     
     # 设置
     transformers.logging.set_verbosity_error()
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
+    tokenizer = None
+    if resume_path:
+        tokenizer_dir = resume_path / "tokenizer"
+        if tokenizer_dir.exists():
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+                msg = f"Loaded tokenizer from checkpoint '{tokenizer_dir}'."
+                if logger:
+                    logger.info(msg)
+                else:
+                    print(f"ℹ️  {msg}")
+            except Exception as err:
+                tokenizer = None
+                error_msg = f"Failed to load tokenizer from '{tokenizer_dir}': {err}"
+                if logger:
+                    logger.warning(error_msg)
+                else:
+                    print(f"⚠️  {error_msg}")
+        else:
+            msg = f"No tokenizer directory found at '{tokenizer_dir}'. Falling back to base tokenizer."
+            if logger:
+                logger.info(msg)
+            else:
+                print(f"ℹ️  {msg}")
+
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        if logger:
+            logger.info("Loaded tokenizer from base model 'gpt2'.")
+
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    
-    model = create_model(model_size=model_size, vocab_size=len(tokenizer)).to(device)
+        if logger:
+            logger.info("Added PAD token to tokenizer.")
+
+    model = None
+    if resume_path:
+        try:
+            model = GPT2LMHeadModel.from_pretrained(resume_path, local_files_only=True)
+            msg = f"Loaded model weights from checkpoint '{resume_path}'."
+            if logger:
+                logger.info(msg)
+            else:
+                print(f"ℹ️  {msg}")
+        except Exception as err:
+            model = None
+            error_msg = f"Failed to load model from '{resume_path}': {err}"
+            if logger:
+                logger.warning(error_msg)
+            else:
+                print(f"⚠️  {error_msg}")
+
+    if model is None:
+        model = create_model(model_size=model_size, vocab_size=len(tokenizer))
+    else:
+        saved_vocab_size = model.get_input_embeddings().weight.size(0)
+        if saved_vocab_size != len(tokenizer):
+            if logger:
+                logger.info(
+                    "Resizing token embeddings from %s to %s to match tokenizer.",
+                    saved_vocab_size,
+                    len(tokenizer),
+                )
+            model.resize_token_embeddings(len(tokenizer))
+
+    if tokenizer.pad_token_id is not None and getattr(model.config, "pad_token_id", None) != tokenizer.pad_token_id:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+    model = model.to(device)
     
     # 检查block_size是否超过模型的最大位置编码
     max_positions = model.config.n_positions
@@ -458,33 +444,46 @@ def train(
 
     csv_path = Path(csv_file) if csv_file else None
     checkpoint_path = Path(checkpoint_dir) if checkpoint_dir else None
+    resume_path = None
+    resume_metadata = None
+    if resume_from_checkpoint:
+        resume_path = Path(resume_from_checkpoint)
+        if not resume_path.is_absolute():
+            resume_path = Path.cwd() / resume_path
+        if not resume_path.exists():
+            warning_msg = f"Resume checkpoint path '{resume_path}' does not exist. Continuing without resuming."
+            if logger:
+                logger.warning(warning_msg)
+            else:
+                print(f"⚠️  {warning_msg}")
+            resume_path = None
+        else:
+            metadata_path = resume_path / "training_state.json"
+            if metadata_path.exists():
+                try:
+                    with open(metadata_path, "r", encoding="utf-8") as f:
+                        resume_metadata = json.load(f)
+                except Exception as err:
+                    error_msg = f"Failed to load training metadata from '{metadata_path}': {err}"
+                    if logger:
+                        logger.warning(error_msg)
+                    else:
+                        print(f"⚠️  {error_msg}")
+            else:
+                info_msg = f"No training_state.json found in '{resume_path}'."
+                if logger:
+                    logger.info(info_msg)
+                else:
+                    print(f"ℹ️  {info_msg}")
+    
     if csv_path:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
     if checkpoint_path:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_manager = None
-    if checkpoint_path:
-        checkpoint_manager = CheckpointManager(
-            checkpoint_path,
-            logger=logger,
-            snapshot_delta=snapshot_delta,
-        )
-
-    evaluation_manager = None
-    if evaluation_results_file:
-        eval_results_path = Path(evaluation_results_file)
-        evaluation_manager = EvaluationManager(
-            device=device,
-            results_file=eval_results_path,
-            logger=logger,
-            max_samples=evaluation_max_samples,
-            block_size=evaluation_block_size,
-        )
-
     if logger:
         logger.info(
-            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_ratio=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s use_lr_scheduler=%s warmup_steps=%s min_lr=%s evaluation_results_file=%s evaluation_max_samples=%s evaluation_block_size=%s snapshot_delta=%s",
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_ratio=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s use_lr_scheduler=%s warmup_steps=%s min_lr=%s resume_from_checkpoint=%s",
             run_name or "unnamed",
             mode,
             scope,
@@ -509,10 +508,7 @@ def train(
             use_lr_scheduler,
             warmup_steps if use_lr_scheduler else 'N/A',
             min_lr if use_lr_scheduler else 'N/A',
-            evaluation_results_file or "None",
-            evaluation_max_samples,
-            evaluation_block_size,
-            snapshot_delta,
+            str(resume_path) if resume_path else 'None',
         )
     
     # 确定可训练参数
@@ -615,28 +611,64 @@ def train(
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_type}")
     
+    if resume_path and optimizer is not None:
+        optimizer_state_path = resume_path / "optimizer.pt"
+        if optimizer_state_path.exists():
+            try:
+                optimizer_state = torch.load(optimizer_state_path, map_location='cpu')
+                if hasattr(optimizer, 'load_state_dict'):
+                    optimizer.load_state_dict(optimizer_state)
+                else:
+                    optimizer.load_state_dict(optimizer_state)  # type: ignore[attr-defined]
+                msg = f"Loaded optimizer state from '{optimizer_state_path}'."
+                if logger:
+                    logger.info(msg)
+                else:
+                    print(f"ℹ️  {msg}")
+            except Exception as err:
+                error_msg = f"Failed to load optimizer state from '{optimizer_state_path}': {err}"
+                if logger:
+                    logger.warning(error_msg)
+                else:
+                    print(f"⚠️  {error_msg}")
+        else:
+            msg = f"No optimizer state found at '{optimizer_state_path}'."
+            if logger:
+                logger.info(msg)
+            else:
+                print(f"ℹ️  {msg}")
+    elif resume_path and optimizer is None:
+        msg = "Optimizer state will not be restored because manual SGD updates are in use."
+        if logger:
+            logger.info(msg)
+        else:
+            print(f"ℹ️  {msg}")
+
     loss_fn = CrossEntropyLoss()
     
     losses = []
     
-    # 初始化 Instruct 参数管理器（仅在 Instruct 模式下使用）
-    instruct_params_manager = None
-    if mode == 'Instruct':
-        instruct_params_manager = InstructParamsManager()
-        print("\n" + "=" * 70)
-        print("🎯 Dynamic Instruct Parameters Manager Initialized")
-        print("=" * 70)
-        print(f"Initial cosine_target: {instruct_cosine_target:.4f}")
-        print(f"Initial noise_scale: {instruct_noise_scale:.4f}")
-        print("\nParameters will adjust dynamically based on training loss:")
-        print(f"  - Loss threshold: {instruct_params_manager.loss_threshold}")
-        print(f"  - Loss step: {instruct_params_manager.loss_step}")
-        print(f"  - Target: {instruct_params_manager.target_initial} → {instruct_params_manager.target_max}")
-        print(f"  - Scale: {instruct_params_manager.scale_initial} → {instruct_params_manager.scale_min}")
-        print("=" * 70 + "\n")
+    initial_step = int(resume_metadata.get('step', 0)) if resume_metadata and resume_metadata.get('step') is not None else 0
+    initial_epoch = int(resume_metadata.get('epoch', 0)) if resume_metadata and resume_metadata.get('epoch') is not None else 0
+    if resume_metadata:
+        resume_loss = resume_metadata.get('loss')
+        resume_grad_norm = resume_metadata.get('grad_norm')
+        resume_lr = resume_metadata.get('current_learning_rate') or resume_metadata.get('learning_rate')
+        msg = (
+            f"Resuming training state from checkpoint: epoch={resume_metadata.get('epoch')}, "
+            f"step={resume_metadata.get('step')}, loss={resume_loss}, grad_norm={resume_grad_norm}, lr={resume_lr}"
+        )
         if logger:
-            logger.info("Instruct parameters manager initialized with dynamic adjustment")
-    
+            logger.info(msg)
+        else:
+            print(f"ℹ️  {msg}")
+    elif resume_path:
+        msg = f"Checkpoint '{resume_path}' does not provide training metadata; starting step counter from zero."
+        if logger:
+            logger.info(msg)
+        else:
+            print(f"ℹ️  {msg}")
+
     # 初始化CSV日志
     if csv_path:
         with open(csv_path, 'w', newline='') as f:
@@ -656,31 +688,29 @@ def train(
                 'optimizer',
                 'bp_interval',
                 'loss',
-                'grad_norm',
-                'instruct_cosine_target',
-                'instruct_noise_scale'
+                'grad_norm'
             ])
     
     # 开始训练
     model.train()
-    step = 0
+    step = initial_step
     # 计算总优化步数（考虑梯度累积）
     batches_per_epoch = len(dataloader)
     total_optimization_steps = (batches_per_epoch * epochs) // gradient_accumulation_steps
     total_steps = total_optimization_steps  # 用于LR调度器
     
     last_metrics = {
-        'loss': None,
-        'grad_norm': None,
-        'epoch': None,
-        'step': None,
-        'current_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
-        'current_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
+        'loss': float(resume_metadata.get('loss')) if resume_metadata and resume_metadata.get('loss') is not None else None,
+        'grad_norm': float(resume_metadata.get('grad_norm')) if resume_metadata and resume_metadata.get('grad_norm') is not None else None,
+        'epoch': initial_epoch if initial_epoch > 0 else None,
+        'step': initial_step if initial_step > 0 else None,
     }
     
     # 梯度累积计数器
     accumulation_counter = 0
     accumulated_loss = 0.0
+    fo_micro_batch_size_hint = batch_size if mode == 'FO' else None
+
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         if logger:
@@ -713,27 +743,108 @@ def train(
             grad_norm = 0.0  # 默认值
             
             if mode == 'FO':
-                if accumulation_counter == 0:
-                    if hasattr(optimizer, 'zero_grad'):
-                        optimizer.zero_grad()
-                    else:
-                        for p in trainable_params:
-                            if p.grad is not None:
-                                p.grad.zero_()
+                total_batch_size = inputs.size(0)
+                previous_hint = fo_micro_batch_size_hint if fo_micro_batch_size_hint is not None else total_batch_size
+                micro_batch_size = min(total_batch_size, previous_hint)
+                last_oom_error = None
+                fo_success = False
 
-                logits = model(inputs).logits
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss = loss_fn(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1)
-                )
+                while micro_batch_size >= 1:
+                    try:
+                        grad_contrib = [torch.zeros_like(p) for p in trainable_params]
+                        total_loss_weighted = 0.0
+                        total_token_count = 0
 
-                loss_value = loss.item()
-                (loss / gradient_accumulation_steps).backward()
+                        for start in range(0, total_batch_size, micro_batch_size):
+                            end = min(start + micro_batch_size, total_batch_size)
+                            chunk_inputs = inputs[start:end]
+                            chunk_labels = labels[start:end]
 
-                accumulation_counter += 1
-                accumulated_loss += loss_value
+                            logits = model(chunk_inputs).logits
+                            shift_logits = logits[..., :-1, :].contiguous()
+                            shift_labels = chunk_labels[..., 1:].contiguous()
+                            loss_chunk = loss_fn(
+                                shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_labels.view(-1)
+                            )
+
+                            grads_chunk = torch.autograd.grad(
+                                loss_chunk,
+                                trainable_params,
+                                retain_graph=False,
+                                create_graph=False,
+                                allow_unused=True,
+                            )
+
+                            chunk_size = chunk_inputs.size(0)
+                            chunk_weight = chunk_size / float(total_batch_size)
+                            for gi, g in enumerate(grads_chunk):
+                                if g is None:
+                                    continue
+                                grad_contrib[gi].add_(g.detach() * (chunk_weight / gradient_accumulation_steps))
+
+                            token_count = shift_labels.numel()
+                            total_loss_weighted += loss_chunk.item() * token_count
+                            total_token_count += token_count
+
+                        average_loss = total_loss_weighted / max(total_token_count, 1)
+
+                        for p, g in zip(trainable_params, grad_contrib):
+                            if g is None:
+                                continue
+                            if p.grad is None:
+                                p.grad = g.detach().clone()
+                            else:
+                                p.grad.add_(g.detach())
+
+                        accumulation_counter += 1
+                        accumulated_loss += average_loss
+                        loss = torch.tensor(average_loss, device=device)
+                        fo_success = True
+                        break
+
+                    except RuntimeError as err:
+                        if not _is_out_of_memory_error(err):
+                            raise
+                        last_oom_error = err
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                        next_micro = micro_batch_size // 2
+                        if next_micro < 1 and micro_batch_size > 1:
+                            next_micro = 1
+                        if next_micro < 1:
+                            break
+
+                        if logger:
+                            logger.warning(
+                                "CUDA OOM at micro batch size %s; retrying with %s (effective batch size=%s).",
+                                micro_batch_size,
+                                next_micro,
+                                total_batch_size,
+                            )
+                        else:
+                            print(f"⚠️  CUDA OOM at micro batch size {micro_batch_size}, retrying with {next_micro}.")
+
+                        micro_batch_size = next_micro
+                        continue
+
+                if not fo_success:
+                    raise last_oom_error if last_oom_error is not None else RuntimeError("Failed to process FO batch due to OOM.")
+
+                micro_chunks_used = math.ceil(total_batch_size / micro_batch_size)
+                if fo_micro_batch_size_hint is None or micro_batch_size < fo_micro_batch_size_hint:
+                    if micro_chunks_used > 1:
+                        fallback_msg = (
+                            f"FO micro-batch fallback: effective batch={total_batch_size}, "
+                            f"micro batch={micro_batch_size}, chunks={micro_chunks_used}"
+                        )
+                        if logger:
+                            logger.info(fallback_msg)
+                        else:
+                            print(f"ℹ️  {fallback_msg}")
+
+                fo_micro_batch_size_hint = micro_batch_size
                 should_update = (accumulation_counter >= gradient_accumulation_steps)
 
                 if should_update:
@@ -752,8 +863,7 @@ def train(
                             if p.grad is not None:
                                 p.grad.zero_()
 
-                    avg_loss = accumulated_loss / accumulation_counter
-                    loss = torch.tensor(avg_loss, device=device)
+                    loss = torch.tensor(accumulated_loss / accumulation_counter, device=device)
 
                     accumulation_counter = 0
                     accumulated_loss = 0.0
@@ -784,23 +894,11 @@ def train(
 
                 manual_dirs = None
                 if mode == 'Instruct' and should_use_bp and bp_grads is not None:
-                    # 动态获取当前的 instruct 参数（基于最新的 loss）
-                    current_cosine_target = instruct_cosine_target
-                    current_noise_scale = instruct_noise_scale
-                    
-                    if instruct_params_manager is not None and losses:
-                        # 使用当前的平均 loss 来更新参数
-                        recent_loss = sum(losses[-10:]) / len(losses[-10:]) if len(losses) >= 10 else sum(losses) / len(losses)
-                        current_cosine_target, current_noise_scale = instruct_params_manager.get_params(recent_loss)
-                        # 更新 last_metrics 以便记录
-                        last_metrics['current_cosine_target'] = current_cosine_target
-                        last_metrics['current_noise_scale'] = current_noise_scale
-                    
                     manual_dirs = generate_instruct_directions_hybrid(
                         bp_grads=bp_grads,
                         q=q,
-                        cosine_target=current_cosine_target,
-                        noise_scale=current_noise_scale,
+                        cosine_target=instruct_cosine_target,
+                        noise_scale=instruct_noise_scale,
                         device=device,
                     )
                     if manual_dirs is None:
@@ -822,8 +920,6 @@ def train(
                     device,
                     manual_directions=manual_dirs,
                     data_provider=query_batch_provider,
-                    parallel_q_computation=parallel_q_computation,
-                    parallel_batch_size=parallel_batch_size,
                 )
 
                 # 在Calibrate模式下使用BP梯度
@@ -891,16 +987,12 @@ def train(
                             optimizer_type,
                             row_bp_interval,
                             loss.item(),
-                            grad_norm,
-                            last_metrics.get('current_cosine_target', 'N/A') if mode == 'Instruct' else 'N/A',
-                            last_metrics.get('current_noise_scale', 'N/A') if mode == 'Instruct' else 'N/A'
+                            grad_norm
                         ])
 
                 if logger:
-                    log_msg = (
-                        "step=%s epoch=%s loss=%.6f grad_norm=%.6f lr=%.6e mode=%s scope=%s q=%s bp_interval=%s"
-                    )
-                    log_args = [
+                    logger.info(
+                        "step=%s epoch=%s loss=%.6f grad_norm=%.6f lr=%.6e mode=%s scope=%s q=%s bp_interval=%s",
                         current_step,
                         epoch + 1,
                         loss.item(),
@@ -910,24 +1002,14 @@ def train(
                         scope,
                         row_q,
                         row_bp_interval,
-                    ]
-                    
-                    # 为 Instruct 模式添加动态参数信息
-                    if mode == 'Instruct' and last_metrics.get('current_cosine_target') is not None:
-                        log_msg += " cosine_target=%.4f noise_scale=%.4f"
-                        log_args.extend([
-                            last_metrics.get('current_cosine_target'),
-                            last_metrics.get('current_noise_scale')
-                        ])
-                    
-                    logger.info(log_msg, *log_args)
+                    )
 
-                if checkpoint_manager:
+                if checkpoint_path:
                     optimizer_state = None
                     if optimizer is not None and hasattr(optimizer, 'state_dict'):
                         optimizer_state = optimizer.state_dict()
 
-                    base_metadata = {
+                    metadata = {
                         'timestamp': timestamp_dt.isoformat(),
                         'run_name': run_name,
                         'mode': mode,
@@ -935,8 +1017,8 @@ def train(
                         'epoch': epoch + 1,
                         'step': current_step,
                         'q': q if mode in zo_like_modes else None,
-                        'learning_rate': lr,  # 初始最大学习率
-                        'current_learning_rate': current_lr,  # 当前学习率
+                        'learning_rate': lr, # 初始最大学习率
+                        'current_learning_rate': current_lr, # 当前学习率
                         'batch_size': batch_size,
                         'gradient_accumulation_steps': gradient_accumulation_steps if mode == 'FO' else 1,
                         'effective_batch_size': batch_size * (gradient_accumulation_steps if mode == 'FO' else 1),
@@ -947,39 +1029,21 @@ def train(
                         'device': device,
                         'model_size': model_size,
                         'dataset': dataset_name,
-                        'instruct_cosine_target': last_metrics.get('current_cosine_target') if mode == 'Instruct' else None,
-                        'instruct_noise_scale': last_metrics.get('current_noise_scale') if mode == 'Instruct' else None,
+                        'checkpoint_type': 'periodic',
+                        'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
+                        'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
                         'use_lr_scheduler': use_lr_scheduler,
                         'warmup_steps': warmup_steps if use_lr_scheduler else None,
                         'min_lr': min_lr if use_lr_scheduler else None,
                     }
-
-                    latest_path = checkpoint_manager.save_latest(
+                    save_latest_checkpoint(
                         model,
                         tokenizer,
+                        checkpoint_path,
                         optimizer_state=optimizer_state,
-                        metadata=base_metadata,
+                        metadata=metadata,
+                        logger=logger,
                     )
-
-                    snapshot_path = checkpoint_manager.maybe_save_snapshot(
-                        float(loss.item()),
-                        model,
-                        tokenizer,
-                        optimizer_state=optimizer_state,
-                        metadata=base_metadata,
-                    )
-
-                    # 只在保存新的snapshot时才进行evaluation
-                    if evaluation_manager and snapshot_path is not None:
-                        evaluation_manager.evaluate(
-                            model,
-                            tokenizer,
-                            step=current_step,
-                            epoch=epoch + 1,
-                            train_loss=float(loss.item()),
-                            checkpoint_path=str(snapshot_path),
-                            checkpoint_type="snapshot",
-                        )
             
             postfix = {
                 "loss": f"{loss.item():.4f}",
@@ -996,19 +1060,17 @@ def train(
         if logger:
             logger.info("Epoch %s/%s completed", epoch + 1, epochs)
 
-    if checkpoint_manager and last_metrics['loss'] is not None:
+    if checkpoint_path and last_metrics['loss'] is not None:
         optimizer_state = None
         if optimizer is not None and hasattr(optimizer, 'state_dict'):
             optimizer_state = optimizer.state_dict()
-        final_step = last_metrics['step'] if last_metrics['step'] is not None else step
-        final_epoch = last_metrics['epoch'] if last_metrics['epoch'] is not None else epochs
         final_metadata = {
             'timestamp': datetime.now().isoformat(),
             'run_name': run_name,
             'mode': mode,
             'scope': scope,
-            'epoch': final_epoch,
-            'step': final_step,
+            'epoch': last_metrics['epoch'],
+            'step': last_metrics['step'],
             'q': q if mode in zo_like_modes else None,
             'learning_rate': lr,
             'batch_size': batch_size,
@@ -1021,36 +1083,21 @@ def train(
             'device': device,
             'model_size': model_size,
             'dataset': dataset_name,
+            'checkpoint_type': 'final',
             'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
             'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
             'use_lr_scheduler': use_lr_scheduler,
             'warmup_steps': warmup_steps if use_lr_scheduler else None,
             'min_lr': min_lr if use_lr_scheduler else None,
         }
-        final_latest_path = checkpoint_manager.save_latest(
+        save_latest_checkpoint(
             model,
             tokenizer,
+            checkpoint_path,
             optimizer_state=optimizer_state,
             metadata=final_metadata,
+            logger=logger,
         )
-        final_snapshot_path = checkpoint_manager.maybe_save_snapshot(
-            last_metrics['loss'],
-            model,
-            tokenizer,
-            optimizer_state=optimizer_state,
-            metadata=final_metadata,
-        )
-        # 只在保存新的snapshot时才进行evaluation
-        if evaluation_manager and final_snapshot_path is not None:
-            evaluation_manager.evaluate(
-                model,
-                tokenizer,
-                step=final_step,
-                epoch=final_epoch,
-                train_loss=last_metrics['loss'],
-                checkpoint_path=str(final_snapshot_path),
-                checkpoint_type="snapshot",
-            )
 
     if logger:
         logger.info("Training complete. Total steps: %s", step)
@@ -1096,16 +1143,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--log_dir", type=str, default=None, help="Directory to store run logs. Defaults to logs/<run_name>_<timestamp>.")
     parser.add_argument("--checkpoint_dir", type=str, default=None, help="Directory to store the latest checkpoint. Defaults to <log_dir>/checkpoint.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to an existing checkpoint directory to resume training from.")
     parser.add_argument("--disable_checkpoint", action="store_true", help="Disable checkpoint saving.")
     parser.add_argument("--run_name", type=str, default=None, help="Optional run name to organize logs and checkpoints.")
-    parser.add_argument("--snapshot_delta", type=float, default=0.5,
-                        help="Loss decrease required to keep an additional snapshot checkpoint (default: 0.5).")
-    parser.add_argument("--evaluation_results_file", type=str, default=None,
-                        help="File path (JSONL) to store evaluation metrics. Defaults to <log_dir>/evaluation_results.jsonl.")
-    parser.add_argument("--evaluation_max_samples", type=int, default=128,
-                        help="Maximum samples to use per downstream evaluation dataset.")
-    parser.add_argument("--evaluation_block_size", type=int, default=256,
-                        help="Tokenization block size for downstream evaluation (default: 256).")
     
     # 模型和数据集参数
     parser.add_argument("--model_size", type=str, default='20M', 
@@ -1145,12 +1185,6 @@ if __name__ == "__main__":
                         help="Number of warmup steps for the LR scheduler.")
     parser.add_argument("--min_lr", type=float, default=1e-6,
                         help="Minimum learning rate for cosine annealing.")
-    
-    # 新增：ZO内存优化和并行计算参数
-    parser.add_argument("--parallel_q_computation", action="store_true",
-                        help="Enable parallel/batch computation of Q values for ZO methods (memory optimized).")
-    parser.add_argument("--parallel_batch_size", type=int, default=4,
-                        help="Batch size for parallel Q computation (default: 4).")
     
     args = parser.parse_args()
 
@@ -1209,13 +1243,12 @@ if __name__ == "__main__":
     if checkpoint_path:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.evaluation_results_file:
-        evaluation_results_path = Path(args.evaluation_results_file)
-        if not evaluation_results_path.is_absolute():
-            evaluation_results_path = run_log_dir / evaluation_results_path
+    if args.resume_from_checkpoint:
+        resume_checkpoint_path = Path(args.resume_from_checkpoint)
+        if not resume_checkpoint_path.is_absolute():
+            resume_checkpoint_path = Path.cwd() / resume_checkpoint_path
     else:
-        evaluation_results_path = run_log_dir / "evaluation_results.jsonl"
-    evaluation_results_path.parent.mkdir(parents=True, exist_ok=True)
+        resume_checkpoint_path = None
 
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
@@ -1245,6 +1278,7 @@ if __name__ == "__main__":
         max_samples=args.max_samples,
         block_size=args.block_size,
         checkpoint_dir=str(checkpoint_path) if checkpoint_path else None,
+        resume_from_checkpoint=str(resume_checkpoint_path) if resume_checkpoint_path else None,
         logger=logger,
         run_name=run_name,
         bp_dataset_name=args.bp_dataset,
@@ -1258,13 +1292,6 @@ if __name__ == "__main__":
         min_lr=args.min_lr,
         # 传递梯度累积参数
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        evaluation_results_file=str(evaluation_results_path),
-        evaluation_max_samples=args.evaluation_max_samples,
-        evaluation_block_size=args.evaluation_block_size,
-        snapshot_delta=args.snapshot_delta,
-        # 传递ZO优化参数
-        parallel_q_computation=args.parallel_q_computation,
-        parallel_batch_size=args.parallel_batch_size,
     )
 
     print(f"CSV metrics saved to {csv_file_path}")
@@ -1276,9 +1303,6 @@ if __name__ == "__main__":
         logger.info("Checkpoint saving disabled.")
     print(f"Training logs saved to {log_file}")
     logger.info("Training logs saved to %s", log_file)
-
-    print(f"Evaluation metrics saved to {evaluation_results_path}")
-    logger.info("Evaluation metrics saved to %s", evaluation_results_path)
 
     for handler in logger.handlers:
         handler.close()
