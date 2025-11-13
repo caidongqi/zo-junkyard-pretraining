@@ -18,9 +18,9 @@ import pandas as pd
 
 # ==================== 配置区域：在这里修改CSV文件路径 ====================
 CSV_FILES = [
-    'plots/csv_data_20M/FO_20M_full_bs4_blk512_qN_A_bpN_A_optmudamw_lr1e-3.csv',
-    'plots/csv_data_20M/ZO_20M_full_bs4_blk512_q8_bpN_A_optmudamw_lr1e-3.csv',
-    'plots/csv_data_20M/Instruct_20M_full_bs4_blk512_q8_bp1_optmudamw_lr1e-3_blend0.2_ct0.01_ns10.0.csv',
+    'plots/csc_data_20M_11.13/FO_20M_full_bs4_blk512_qN_A_bpN_A_optmudamw_lr1e-3.csv',
+    'plots/csc_data_20M_11.13/ZO_20M_full_bs4_blk512_q8_bpN_A_optmudamw_lr1e-3.csv',
+    'plots/csc_data_20M_11.13/Instruct_20M_full_bs4_blk512_q8_bp1_optmudamw_lr1e-3_blend0.9_ct0.01_ns10.0.csv',
 ]
 
 LABEL_CURATED = ["FO", "ZO", "Ours"]  # 自定义标签列表（如果为空则自动生成）
