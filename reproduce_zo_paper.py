@@ -409,6 +409,7 @@ def train(
     blend_ratio=0.0,
     instruct_cosine_target=DEFAULT_INSTRUCT_COSINE_TARGET,
     instruct_noise_scale=DEFAULT_INSTRUCT_NOISE_SCALE,
+    grad_clip_norm=None,
     # 新增LR调度器参数
     use_lr_scheduler=False,
     warmup_steps=300,
@@ -492,7 +493,7 @@ def train(
 
     if logger:
         logger.info(
-            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_ratio=%s instruct_cosine_target=%s instruct_noise_scale=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s use_lr_scheduler=%s warmup_steps=%s min_lr=%s evaluation_results_file=%s evaluation_max_samples=%s evaluation_block_size=%s snapshot_delta=%s",
+            "Starting training run '%s' with configuration: mode=%s scope=%s q=%s lr=%s epochs=%s batch_size=%s gradient_accumulation_steps=%s effective_batch_size=%s block_size=%s optimizer=%s bp_interval=%s blend_ratio=%s instruct_cosine_target=%s instruct_noise_scale=%s grad_clip_norm=%s device=%s dataset=%s model_size=%s max_samples=%s bp_dataset=%s bp_max_samples=%s use_lr_scheduler=%s warmup_steps=%s min_lr=%s evaluation_results_file=%s evaluation_max_samples=%s evaluation_block_size=%s snapshot_delta=%s",
             run_name or "unnamed",
             mode,
             scope,
@@ -508,6 +509,7 @@ def train(
             blend_ratio,
             instruct_cosine_target,
             instruct_noise_scale,
+            grad_clip_norm if grad_clip_norm is not None else 'N/A',
             device,
             dataset_name,
             model_size,
@@ -881,6 +883,32 @@ def train(
                         grad_norm_sq += float(torch.sum(g.detach() * g.detach()).item())
                 grad_norm = math.sqrt(grad_norm_sq)
 
+                if (
+                    mode == 'Instruct'
+                    and grad_clip_norm is not None
+                    and grad_clip_norm > 0
+                    and grad_norm > grad_clip_norm
+                ):
+                    clip_coef = grad_clip_norm / (grad_norm + 1e-6)
+                    grad_paramwise = [
+                        g * clip_coef if g is not None else None
+                        for g in grad_paramwise
+                    ]
+                    if logger:
+                        logger.info(
+                            "Gradient norm clipped from %.6f to %.6f (max %.6f)",
+                            grad_norm,
+                            grad_norm * clip_coef,
+                            grad_clip_norm,
+                        )
+                    else:
+                        print(
+                            f"Gradient norm clipped from {grad_norm:.6f} to {grad_norm * clip_coef:.6f} "
+                            f"(max {grad_clip_norm:.6f})"
+                        )
+                    grad_norm *= clip_coef
+                    grad_norm_sq *= clip_coef * clip_coef
+
                 if optimizer is None: # 手动 SGD 更新
                     for p, g in zip(trainable_params, grad_paramwise):
                         if g is None:
@@ -992,6 +1020,7 @@ def train(
                         'use_lr_scheduler': use_lr_scheduler,
                         'warmup_steps': warmup_steps if use_lr_scheduler else None,
                         'min_lr': min_lr if use_lr_scheduler else None,
+                        'grad_clip_norm': grad_clip_norm,
                     }
 
                     latest_path = checkpoint_manager.save_latest(
@@ -1078,6 +1107,7 @@ def train(
             'use_lr_scheduler': use_lr_scheduler,
             'warmup_steps': warmup_steps if use_lr_scheduler else None,
             'min_lr': min_lr if use_lr_scheduler else None,
+            'grad_clip_norm': grad_clip_norm,
         }
         final_latest_path = checkpoint_manager.save_latest(
             model,
@@ -1192,6 +1222,8 @@ if __name__ == "__main__":
                         help="Target cosine similarity for hybrid instruct direction generation.")
     parser.add_argument("--instruct_noise_scale", type=float, default=DEFAULT_INSTRUCT_NOISE_SCALE,
                         help="Noise scale for hybrid instruct direction generation.")
+    parser.add_argument("--grad_clip_norm", type=float, default=None,
+                        help="Maximum gradient norm for clipping in Instruct mode. Disabled when omitted or non-positive.")
 
     # 新增：学习率调度器参数
     parser.add_argument("--use_lr_scheduler", action="store_true",
@@ -1320,6 +1352,7 @@ if __name__ == "__main__":
         # 传递ZO优化参数
         parallel_q_computation=args.parallel_q_computation,
         parallel_batch_size=args.parallel_batch_size,
+        grad_clip_norm=args.grad_clip_norm,
     )
 
     print(f"CSV metrics saved to {csv_file_path}")
