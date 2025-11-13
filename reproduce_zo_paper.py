@@ -225,42 +225,42 @@ def zo_gradient_estimator(
             used_directions += remaining_q
         else:
             # 原始顺序版本（内存优化）
-    seeds = []
-    proj_grads = []
-    for _ in range(remaining_q):
-        seed = torch.randint(0, 2**31 - 1, ()).item()
-        seeds.append(seed)
+            seeds = []
+            proj_grads = []
+            for _ in range(remaining_q):
+                seed = torch.randint(0, 2**31 - 1, ()).item()
+                seeds.append(seed)
 
-        batch_inputs, batch_labels = get_batch()
+                batch_inputs, batch_labels = get_batch()
 
-        torch.manual_seed(seed)
+                torch.manual_seed(seed)
                 for p, orig in zip(trainable_params, original_data):
-            z = torch.randn_like(p.data)
+                    z = torch.randn_like(p.data)
                     p.data = orig + epsilon * z
-        loss_pos = compute_loss(batch_inputs, batch_labels)
+                loss_pos = compute_loss(batch_inputs, batch_labels)
 
-        torch.manual_seed(seed)
+                torch.manual_seed(seed)
                 for p, orig in zip(trainable_params, original_data):
-            z = torch.randn_like(p.data)
+                    z = torch.randn_like(p.data)
                     p.data = orig - epsilon * z
-        loss_neg = compute_loss(batch_inputs, batch_labels)
+                loss_neg = compute_loss(batch_inputs, batch_labels)
 
                 # 恢复参数
                 restore_params()
 
-        proj_grads.append(((loss_pos - loss_neg) / (2 * epsilon)).item())
+                proj_grads.append(((loss_pos - loss_neg) / (2 * epsilon)).item())
                 
                 # 清理显存（每个query后）
                 if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
                     torch.cuda.empty_cache()
 
-    # 重建随机方向贡献
-    for seed, proj in zip(seeds, proj_grads):
-        torch.manual_seed(seed)
-        for gi, p in enumerate(trainable_params):
-            z = torch.randn_like(p.data)
-            grads[gi].add_(proj * z)
-        used_directions += 1
+            # 重建随机方向贡献
+            for seed, proj in zip(seeds, proj_grads):
+                torch.manual_seed(seed)
+                for gi, p in enumerate(trainable_params):
+                    z = torch.randn_like(p.data)
+                    grads[gi].add_(proj * z)
+                used_directions += 1
 
     if used_directions > 0:
         for gi in range(len(grads)):
@@ -726,8 +726,8 @@ def train(
             
             if mode == 'FO':
                 if accumulation_counter == 0:
-                if hasattr(optimizer, 'zero_grad'):
-                    optimizer.zero_grad()
+                    if hasattr(optimizer, 'zero_grad'):
+                        optimizer.zero_grad()
                     else:
                         for p in trainable_params:
                             if p.grad is not None:
@@ -749,13 +749,13 @@ def train(
                 should_update = (accumulation_counter >= gradient_accumulation_steps)
 
                 if should_update:
-                grad_norm_sq = 0.0
-                for p in trainable_params:
-                    if p.grad is not None:
-                        grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
-                grad_norm = math.sqrt(grad_norm_sq)
-                
-                optimizer.step()
+                    grad_norm_sq = 0.0
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
+                    grad_norm = math.sqrt(grad_norm_sq)
+                    
+                    optimizer.step()
 
                     if hasattr(optimizer, 'zero_grad'):
                         optimizer.zero_grad()
