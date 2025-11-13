@@ -207,15 +207,15 @@ def generate_instruct_directions_hybrid(
                 final_similarity = float(torch.dot(hybrid_flat, grad_flat) / (hybrid_norm * total_norm))
             total_cosine += final_similarity
 
-            print("-" * 60)
-            print(
-                f"[Instruct-Hybrid] direction #{direction_idx + 1}: "
-                f"d={d}, effective_rank={effective_rank} ({effective_rank / d:.2%} of total)"
-            )
-            print(f"  cosine_target={cosine_target}")
-            print(f"  noise_scale={noise_scale}")
-            print(f"  actual_cosine_similarity={final_similarity:.6f}")
-            print("-" * 60)
+            # print("-" * 60)
+            # print(
+            #     f"[Instruct-Hybrid] direction #{direction_idx + 1}: "
+            #     f"d={d}, effective_rank={effective_rank} ({effective_rank / d:.2%} of total)"
+            # )
+            # print(f"  cosine_target={cosine_target}")
+            # print(f"  noise_scale={noise_scale}")
+            # print(f"  actual_cosine_similarity={final_similarity:.6f}")
+            # print("-" * 60)
 
             direction = []
             start = 0

@@ -24,14 +24,15 @@ class CheckpointManager:
         logger=None,
         snapshot_delta: float = 0.5,
         snapshot_delta_2: float = 0.1,
-        turning_point: float = 4.5
+        turning_point: float = 4.5,
+        best_loss: float = 1e9,
     ):
         self.logger = logger
         self.snapshot_delta = snapshot_delta
         self.snapshot_delta_2 = snapshot_delta_2
         self.turning_point = turning_point
         self.base_dir = Path(base_dir) if base_dir else None
-        self.best_loss: Optional[float] = None  # Track the global best (lowest) loss
+        self.best_loss: Optional[float] = best_loss  # Track the global best (lowest) loss
 
         if self.base_dir:
             self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -111,20 +112,17 @@ class CheckpointManager:
         if self.base_dir is None:
             return None
 
-        # Only save if this is the first snapshot OR if loss is lower than best_loss by snapshot_delta
+        # Only save if loss is lower than best_loss by snapshot_delta
         should_save = False
-        if self.best_loss is None:
-            # First snapshot
-            should_save = True
+
+        # Use different snapshot delta based on turning point
+        if loss_value <= self.turning_point:
+            delta = self.snapshot_delta_2
         else:
-            # Use different snapshot delta based on turning point
-            if loss_value <= self.turning_point:
-                delta = self.snapshot_delta_2
-            else:
-                delta = self.snapshot_delta
-            if loss_value <= self.best_loss - delta:
-                # Loss has decreased by at least the applicable snapshot_delta from the global best
-                should_save = True
+            delta = self.snapshot_delta
+        if loss_value <= self.best_loss - delta:
+            # Loss has decreased by at least the applicable snapshot_delta from the global best
+            should_save = True
 
         if not should_save:
             return None
