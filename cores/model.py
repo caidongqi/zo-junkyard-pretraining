@@ -28,7 +28,7 @@ MODEL_CONFIGS = {
         'n_embd': 768,      # 嵌入维度
         'n_layer': 12,      # Transformer 层数
         'n_head': 12,       # 注意力头数
-        'n_positions': 4096, # 最大序列长度
+        'n_positions': 1024, # 最大序列长度
         'description': '中小型模型，约200M参数，类似GPT-2 Small',
         'estimated_params': '200M',
     },

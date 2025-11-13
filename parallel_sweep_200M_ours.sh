@@ -23,15 +23,17 @@ CLEANUP_DONE=false
 # 默认配置参数
 MODES=("Instruct") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
-BATCH_SIZES=(8)
+BATCH_SIZES=(4) # ！！不可以调大！！
+GRADIENT_ACCUMULATION_STEPS=8  # 梯度累积步数，1表示不使用梯度累积
 BLOCK_SIZES=(512)  # 序列长度 (可选: 64, 128, 256, 512, 1024)
 QUERY_BUDGETS=(8)
 BP_INTERVALS=(1)
+BLEND_RATIOS=(0.1 0.2 0.5 0.9)  # Instruct模式梯度混合比例: 0.0=纯ZO, 1.0=纯BP, 0.5=均等混合
 INSTRUCT_COSINE_TARGETS=(0.01)
 INSTRUCT_NOISE_SCALES=(10.0)
 LEARNING_RATES_ZO=(1e-3)
 OPTIMIZERS=("mudamw")  # 可选: sgd, adam, mudamw
-EPOCHS=10
+EPOCHS=1
 LOG_INTERVAL=10
 
 # 学习率调度器配置 (Learning Rate Scheduler Configuration)
@@ -41,7 +43,11 @@ MIN_LR=1e-6           # 最小学习率
 
 # 梯度累积配置 (Gradient Accumulation Configuration)
 # 仅适用于FO模式。有效batch size = batch_size * gradient_accumulation_steps
-GRADIENT_ACCUMULATION_STEPS=8  # 梯度累积步数，1表示不使用梯度累积
+
+# ZO并行计算配置 (ZO Parallel Computation Configuration)
+# 仅适用于ZO、Calibrate、Instruct模式
+USE_PARALLEL_Q_COMPUTATION=false  # 是否启用并行Q值计算（内存优化）
+PARALLEL_BATCH_SIZE=4             # 并行计算时的批次大小
 
 LOGS_ROOT="logs"
 
@@ -68,17 +74,17 @@ DATASET="fineweb-edu-10bt"  # 默认使用cosmopedia-100k (快速测试推荐fin
 # 建议值参考:
 #   cosmopedia-100k(20000), cosmopedia(100000), openwebtext(50000), c4(100000)
 #   fineweb(100000), fineweb-edu(50000), fineweb-edu-10bt(30000)
-MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字如: 20000
+MAX_SAMPLES="1000000"  # 留空使用推荐值，或指定具体数字如: 20000
 
 # BP数据集配置 (BP Dataset Configuration for Calibrate/Instruct modes)
 # 用于Calibrate/Instruct模式中BP梯度计算的数据集
 # 留空表示使用与主训练相同的数据集
-BP_DATASET="fineweb-edu-10bt"  # 留空使用主数据集，或指定不同的数据集如: "cosmopedia-100k"
+BP_DATASET=""  # 留空使用主数据集，或指定不同的数据集如: "cosmopedia-100k"
 BP_MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字
 
 # 并行配置
 MAX_PARALLEL_JOBS=32 # 最大并行任务数
-GPU_IDS="5"           # GPU ID列表，空表示自动检测
+GPU_IDS="4"           # GPU ID列表，空表示自动检测
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -151,6 +157,10 @@ while [[ $# -gt 0 ]]; do
             BP_MAX_SAMPLES="$2"
             shift 2
             ;;
+        --blend-ratios)
+            IFS=',' read -ra BLEND_RATIOS <<< "$2"
+            shift 2
+            ;;
         --instruct-cosine-targets)
             IFS=',' read -ra INSTRUCT_COSINE_TARGETS <<< "$2"
             shift 2
@@ -179,6 +189,18 @@ while [[ $# -gt 0 ]]; do
             GRADIENT_ACCUMULATION_STEPS="$2"
             shift 2
             ;;
+        --parallel-q-computation)
+            USE_PARALLEL_Q_COMPUTATION=true
+            shift 1
+            ;;
+        --no-parallel-q-computation)
+            USE_PARALLEL_Q_COMPUTATION=false
+            shift 1
+            ;;
+        --parallel-batch-size)
+            PARALLEL_BATCH_SIZE="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo "Options:"
@@ -203,6 +225,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --bp-dataset NAME    BP数据集名称 (Calibrate/Instruct模式用)"
             echo "                       留空使用主数据集 (默认: 使用主数据集)"
             echo "  --bp-max-samples N   BP数据集最大样本数 (默认: 使用推荐值)"
+            echo "  --blend-ratios '0.0,0.5,1.0'           Instruct模式的梯度混合比例 (默认: 0.0,0.5,1.0)"
+            echo "                       0.0=纯ZO, 1.0=纯BP, 0.5=均等混合"
             echo "  --instruct-cosine-targets '0.9,0.95'   Instruct模式的余弦目标 (默认: 0.9)"
             echo "  --instruct-noise-scales '0.5,1.0'      Instruct模式的噪声强度 (默认: 0.5)"
             echo "  --use-lr-scheduler   启用余弦退火学习率调度器 (默认: 启用)"
@@ -211,6 +235,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --min-lr VALUE       最小学习率 (默认: 1e-6)"
             echo "  --gradient-accumulation-steps N  梯度累积步数 (仅FO模式, 默认: 1)"
             echo "                       有效batch size = batch_size * gradient_accumulation_steps"
+            echo "  --parallel-q-computation          启用并行Q值计算 (仅ZO/Calibrate/Instruct模式, 默认: 禁用)"
+            echo "  --no-parallel-q-computation      禁用并行Q值计算"
+            echo "  --parallel-batch-size N          并行Q值计算的批次大小 (默认: 4)"
             echo "  -h, --help           显示帮助信息"
             exit 0
             ;;
@@ -241,7 +268,7 @@ fi
 
 # 创建日志与结果目录
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RUN_DESCRIPTOR="${MODES}_${SCOPES}_${BATCH_SIZES}_${QUERY_BUDGETS}_${BP_INTERVALS}_${LEARNING_RATES_ZO}_${OPTIMIZERS}_${EPOCHS}_${LOG_INTERVAL}_${INSTRUCT_COSINE_TARGETS}_${INSTRUCT_NOISE_SCALES}"
+RUN_DESCRIPTOR="${MODES}_${SCOPES}_${BATCH_SIZES}_${QUERY_BUDGETS}_${BP_INTERVALS}_${BLEND_RATIOS}_${LEARNING_RATES_ZO}_${OPTIMIZERS}_${EPOCHS}_${LOG_INTERVAL}_${INSTRUCT_COSINE_TARGETS}_${INSTRUCT_NOISE_SCALES}"
 mkdir -p "$LOGS_ROOT"
 RUN_LOG_ROOT="${LOGS_ROOT}/parallel_sweep_${TIMESTAMP}"
 EXPERIMENT_LOG_ROOT="${RUN_LOG_ROOT}/experiments"
@@ -367,13 +394,13 @@ generate_experiments() {
                         for optimizer in "${OPTIMIZERS[@]}"; do
                             if [ "$mode" = "FO" ]; then
                                 for lr in "${LEARNING_RATES_ZO[@]}"; do
-                                    experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:N/A:$lr:$optimizer:N/A:$model_size:N/A:N/A")
+                                    experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:N/A:$lr:$optimizer:N/A:$model_size:N/A:N/A:N/A")
                                     exp_id=$((exp_id + 1))
                                 done
                             elif [ "$mode" = "ZO" ]; then
                                 for q in "${QUERY_BUDGETS[@]}"; do
                                     for lr in "${LEARNING_RATES_ZO[@]}"; do
-                                        experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:N/A:$model_size:N/A:N/A")
+                                        experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:N/A:$model_size:N/A:N/A:N/A")
                                         exp_id=$((exp_id + 1))
                                     done
                                 done
@@ -381,10 +408,12 @@ generate_experiments() {
                                 for q in "${QUERY_BUDGETS[@]}"; do
                                     for lr in "${LEARNING_RATES_ZO[@]}"; do
                                         for bp_interval in "${BP_INTERVALS[@]}"; do
-                                            for cos_target in "${INSTRUCT_COSINE_TARGETS[@]}"; do
-                                                for noise_scale in "${INSTRUCT_NOISE_SCALES[@]}"; do
-                                                    experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:$cos_target:$noise_scale")
-                                                    exp_id=$((exp_id + 1))
+                                            for blend_ratio in "${BLEND_RATIOS[@]}"; do
+                                                for cos_target in "${INSTRUCT_COSINE_TARGETS[@]}"; do
+                                                    for noise_scale in "${INSTRUCT_NOISE_SCALES[@]}"; do
+                                                        experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:$blend_ratio:$cos_target:$noise_scale")
+                                                        exp_id=$((exp_id + 1))
+                                                    done
                                                 done
                                             done
                                         done
@@ -394,7 +423,7 @@ generate_experiments() {
                                 for q in "${QUERY_BUDGETS[@]}"; do
                                     for lr in "${LEARNING_RATES_ZO[@]}"; do
                                         for bp_interval in "${BP_INTERVALS[@]}"; do
-                                            experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:N/A:N/A")
+                                            experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:N/A:N/A:N/A")
                                             exp_id=$((exp_id + 1))
                                         done
                                     done
@@ -415,22 +444,27 @@ run_single_experiment() {
     local exp_config="$1"
     local gpu_id="$2"
     
-    IFS=':' read -r exp_id mode scope batch_size block_size q lr optimizer bp_interval model_size cos_target noise_scale <<< "$exp_config"
+    IFS=':' read -r exp_id mode scope batch_size block_size q lr optimizer bp_interval model_size blend_ratio cos_target noise_scale <<< "$exp_config"
     
     # 将 N/A 替换为 NA 以避免文件路径问题
     local q_safe="${q//\//_}"
     local bp_safe="${bp_interval//\//_}"
+    local blend_safe="${blend_ratio//\//_}"
     local cos_safe="${cos_target//\//_}"
     local noise_safe="${noise_scale//\//_}"
+    local blend_label=""
     local cos_label=""
     local noise_label=""
+    if [ "$blend_ratio" != "N/A" ]; then
+        blend_label="_blend${blend_safe}"
+    fi
     if [ "$cos_target" != "N/A" ]; then
         cos_label="_ct${cos_safe}"
     fi
     if [ "$noise_scale" != "N/A" ]; then
         noise_label="_ns${noise_safe}"
     fi
-    local exp_name="${mode}_${model_size}_${scope}_bs${batch_size}_blk${block_size}_q${q_safe}_bp${bp_safe}_opt${optimizer}_lr${lr}${cos_label}${noise_label}"
+    local exp_name="${mode}_${model_size}_${scope}_bs${batch_size}_blk${block_size}_q${q_safe}_bp${bp_safe}_opt${optimizer}_lr${lr}${blend_label}${cos_label}${noise_label}"
     local csv_file="${CSV_DIR}/${exp_name}.csv"
     local job_log="${JOB_LOG_DIR}/${exp_name}.log"
     local exp_log_dir="${EXPERIMENT_LOG_ROOT}/${exp_name}"
@@ -477,6 +511,9 @@ run_single_experiment() {
     if [ "$bp_interval" != "N/A" ]; then
         cmd="$cmd --bp_interval $bp_interval"
     fi
+    if [ "$mode" = "Instruct" ] && [ "$blend_ratio" != "N/A" ]; then
+        cmd="$cmd --blend_ratio $blend_ratio"
+    fi
     if [ "$mode" = "Instruct" ] && [ "$cos_target" != "N/A" ]; then
         cmd="$cmd --instruct_cosine_target $cos_target"
     fi
@@ -496,6 +533,14 @@ run_single_experiment() {
         cmd="$cmd --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS"
     fi
     
+    # ZO并行计算参数（仅ZO/Calibrate/Instruct模式）
+    if [[ "$mode" == "ZO" || "$mode" == "Calibrate" || "$mode" == "Instruct" ]]; then
+        if [ "$USE_PARALLEL_Q_COMPUTATION" = true ]; then
+            cmd="$cmd --parallel_q_computation"
+        fi
+        cmd="$cmd --parallel_batch_size $PARALLEL_BATCH_SIZE"
+    fi
+    
     # 设置GPU环境变量
     if [ "$gpu_id" != "cpu" ]; then
         export CUDA_VISIBLE_DEVICES="$gpu_id"
@@ -510,6 +555,7 @@ run_single_experiment() {
     echo "Experiment log dir: $exp_log_dir" >> "$job_log"
     echo "Checkpoint dir: $checkpoint_dir" >> "$job_log"
     if [ "$mode" = "Instruct" ]; then
+        echo "Instruct blend ratio: $blend_ratio" >> "$job_log"
         echo "Instruct cosine target: $cos_target" >> "$job_log"
         echo "Instruct noise scale: $noise_scale" >> "$job_log"
     fi
@@ -790,6 +836,8 @@ main() {
     echo "BP_MAX_SAMPLES: ${BP_MAX_SAMPLES:-auto}" >> "$LOG_FILE"
     echo "INSTRUCT_COSINE_TARGETS: ${INSTRUCT_COSINE_TARGETS[*]}" >> "$LOG_FILE"
     echo "INSTRUCT_NOISE_SCALES: ${INSTRUCT_NOISE_SCALES[*]}" >> "$LOG_FILE"
+    echo "USE_PARALLEL_Q_COMPUTATION: ${USE_PARALLEL_Q_COMPUTATION}" >> "$LOG_FILE"
+    echo "PARALLEL_BATCH_SIZE: ${PARALLEL_BATCH_SIZE}" >> "$LOG_FILE"
     echo "MAX_PARALLEL_JOBS: $MAX_PARALLEL_JOBS" >> "$LOG_FILE"
     echo "GPU_IDS: $GPU_IDS" >> "$LOG_FILE"
     echo "=========================================" >> "$LOG_FILE"

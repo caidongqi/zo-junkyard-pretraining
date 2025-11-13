@@ -20,12 +20,39 @@ echo "=========================================="
 
 python downstream_evaluation.py \
     --task generation \
-    --checkpoint_path "$CHECKPOINT_PATH" \
     --prompts "Hello, how are you?" "What is AI?" "Once upon a time" \
     --max_length 80 \
     --temperature 0.8 \
     --num_generations 3 \
-    --output_file "$OUTPUT_DIR/generation_eval.json"
+    --output_file "$OUTPUT_DIR/generation_eval.json" \
+    --checkpoint_path "/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251112_000045/experiments/FO_500M_full_bs4_blk512_qN_A_bpN_A_optmudamw_lr1e-3/logs/parallel_sweep_20251112_000045/experiments/FO_500M_full_bs4_blk512_qN_A_bpN_A_optmudamw_lr1e-3/checkpoint"
+# 下游任务评估示例脚本
+# Example script for downstream task evaluation
+
+echo "=========================================="
+echo "下游任务评估示例 (Downstream Task Evaluation Examples)"
+echo "=========================================="
+
+# 设置变量（请根据实际情况修改）
+# Set variables (modify according to your setup)
+CHECKPOINT_PATH="/data/cdq/current_project/zo-test-cdq/logs/parallel_sweep_20251109_221054/experiments/Instruct_20M_full_bs32_q8_bp1_optmudamw_lr1e-3_ct0.01_ns10.0/logs/parallel_sweep_20251109_221054/experiments/Instruct_20M_full_bs32_q8_bp1_optmudamw_lr1e-3_ct0.01_ns10.0/checkpoint"
+OUTPUT_DIR="results/downstream_eval"
+
+mkdir -p $OUTPUT_DIR
+
+echo ""
+echo "示例 1: 文本生成评估"
+echo "Example 1: Text Generation Evaluation"
+echo "=========================================="
+
+python downstream_evaluation.py \
+    --task generation \
+    --prompts "Hello, how are you?" "What is AI?" "Once upon a time" \
+    --max_length 80 \
+    --temperature 0.8 \
+    --num_generations 3 \
+    --output_file "$OUTPUT_DIR/generation_eval.json" \
+    --checkpoint_path "$CHECKPOINT_PATH"
 
 echo ""
 echo "示例 2: SST-2分类任务评估（微调）"
