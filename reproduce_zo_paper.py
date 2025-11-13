@@ -688,6 +688,10 @@ def train(
                     manual_directions=manual_dirs,
                     data_provider=query_batch_provider,
                 )
+                
+                # ZO梯度估计后立即清理显存
+                if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
+                    torch.cuda.empty_cache()
 
                 # 在Calibrate模式下使用BP梯度
                 if mode == 'Calibrate' and should_use_bp and bp_grads is not None:
