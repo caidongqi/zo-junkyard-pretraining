@@ -23,7 +23,7 @@ CLEANUP_DONE=false
 # 默认配置参数
 MODES=("Instruct") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
-BATCH_SIZES=(4) # ！！不可以调大
+BATCH_SIZES=(4) # ！！不可以调的比baseline大
 GRADIENT_ACCUMULATION_STEPS=8  # 梯度累积步数，1表示不使用梯度累积
 BLOCK_SIZES=(512)  # 序列长度 (可选: 64, 128, 256, 512, 1024)
 QUERY_BUDGETS=(8)
