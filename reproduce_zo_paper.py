@@ -622,7 +622,11 @@ def train(
     # 初始化 Instruct 参数管理器（仅在 Instruct 模式下使用）
     instruct_params_manager = None
     if mode == 'Instruct':
-        instruct_params_manager = InstructParamsManager()
+        # 使用从parallel_sweep.sh传入的初始值
+        instruct_params_manager = InstructParamsManager(
+            target_initial=instruct_cosine_target,
+            scale_initial=instruct_noise_scale
+        )
         print("\n" + "=" * 70)
         print("🎯 Dynamic Instruct Parameters Manager Initialized")
         print("=" * 70)

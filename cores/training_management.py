@@ -118,7 +118,7 @@ class CheckpointManager:
             should_save = True
         else:
             # Use different snapshot delta based on turning point
-            if loss_value > self.turning_point:
+            if loss_value <= self.turning_point:
                 delta = self.snapshot_delta_2
             else:
                 delta = self.snapshot_delta
