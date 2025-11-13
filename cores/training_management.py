@@ -118,7 +118,7 @@ class CheckpointManager:
             should_save = True
         else:
             # Use different snapshot delta based on turning point
-            if loss_value > self.turning_point:
+            if loss_value <= self.turning_point:
                 delta = self.snapshot_delta_2
             else:
                 delta = self.snapshot_delta
@@ -192,12 +192,15 @@ class EvaluationManager:
     def _prepare_texts(self, dataset_id: str) -> Iterable[str]:
         from datasets import load_dataset
 
+        # 优先使用本地缓存，如果不存在才下载
+        download_mode = "reuse_cache_if_exists"
+
         if dataset_id == "sst2":
-            dataset = load_dataset("glue", "sst2", split="validation")
+            dataset = load_dataset("glue", "sst2", split="validation", download_mode=download_mode)
             for example in dataset.select(range(min(self.max_samples, len(dataset)))):
                 yield example["sentence"]
         elif dataset_id == "squad":
-            dataset = load_dataset("squad", split="validation")
+            dataset = load_dataset("squad", split="validation", download_mode=download_mode)
             count = 0
             for example in dataset:
                 answers = example.get("answers", {}).get("text", [])
@@ -216,7 +219,7 @@ class EvaluationManager:
         # [新增] 为 LAMBADA 数据集做准备
         elif dataset_id == "lambada":
             # LAMBADA 评估通常在 test split 上进行
-            dataset = load_dataset("lambada", split="test")
+            dataset = load_dataset("lambada", split="test", download_mode=download_mode)
             for example in dataset.select(range(min(self.max_samples, len(dataset)))):
                 yield example["text"]
         else:
@@ -387,12 +390,15 @@ class EvaluationManager:
             f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
 
         # 更新日志输出以包含 LAMBADA 指标
+        def format_metric(value):
+            return f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
+
         log_message = (
             f"Evaluation recorded at step {step}: "
-            f"SST-2 ppl={metrics.get('sst2_perplexity', 'N/A'):.4f}, "
-            f"SQuAD ppl={metrics.get('squad_perplexity', 'N/A'):.4f}, "
-            f"LAMBADA ppl={metrics.get('lambada_perplexity', 'N/A'):.4f}, "
-            f"LAMBADA acc={metrics.get('lambada_accuracy', 'N/A'):.4f}"
+            f"SST-2 ppl={format_metric(metrics.get('sst2_perplexity', 'N/A'))}, "
+            f"SQuAD ppl={format_metric(metrics.get('squad_perplexity', 'N/A'))}, "
+            f"LAMBADA ppl={format_metric(metrics.get('lambada_perplexity', 'N/A'))}, "
+            f"LAMBADA acc={format_metric(metrics.get('lambada_accuracy', 'N/A'))}"
         )
         self._log(log_message)
 

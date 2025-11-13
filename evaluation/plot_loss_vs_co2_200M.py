@@ -20,7 +20,7 @@ import pandas as pd
 CSV_FILES = [
     'plots/csv_data_200M/FO_200M_full_bs4_blk512_qN_A_bpN_A_optmudamw_lr1e-3.csv',
     'plots/csv_data_200M/ZO_200M_full_bs4_blk512_q8_bpN_A_optmudamw_lr1e-3.csv',
-    'plots/csv_data_200M/Instruct_200M_full_bs4_blk512_q8_bp1_optmudamw_lr1e-3_blend0.2_ct0.01_ns10.0.csv',
+    'plots/csv_data_200M/Instruct_200M_full_bs4_blk512_q8_bp1_optmudamw_lr1e-3_blend0.8_ct0.01_ns10.0.csv',
 ]
 
 LABEL_CURATED = ["FO", "ZO", "Ours"]  # 自定义标签列表（如果为空则自动生成）

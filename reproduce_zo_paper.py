@@ -630,7 +630,11 @@ def train(
     # 初始化 Instruct 参数管理器（仅在 Instruct 模式下使用）
     instruct_params_manager = None
     if mode == 'Instruct':
-        instruct_params_manager = InstructParamsManager()
+        # 使用从parallel_sweep.sh传入的初始值
+        instruct_params_manager = InstructParamsManager(
+            target_initial=instruct_cosine_target,
+            scale_initial=instruct_noise_scale
+        )
         print("\n" + "=" * 70)
         print("🎯 Dynamic Instruct Parameters Manager Initialized")
         print("=" * 70)
@@ -857,6 +861,19 @@ def train(
                         (1 - blend_ratio) * gz + blend_ratio * gb
                         for gz, gb in zip(grad_paramwise, bp_grads)
                     ]
+                
+                # 清理不再需要的临时变量（释放内存）
+                # 注意：这些变量在混合梯度后不再需要
+                try:
+                    if 'manual_dirs' in locals():
+                        del manual_dirs
+                except:
+                    pass
+                try:
+                    if 'bp_grads' in locals():
+                        del bp_grads
+                except:
+                    pass
 
                 grad_norm_sq = 0.0
                 for g in grad_paramwise:
@@ -877,6 +894,9 @@ def train(
                 step += 1
 
             losses.append(loss.item())
+            # 限制losses列表大小，防止内存无限增长（只保留最近10000个值）
+            if len(losses) > 10000:
+                losses = losses[-10000:]
             current_step = step
             last_metrics.update({
                 'loss': float(loss.item()),
@@ -999,7 +1019,14 @@ def train(
                             train_loss=float(loss.item()),
                             checkpoint_path=str(snapshot_path),
                             checkpoint_type="snapshot",
-                    )
+                        )
+                        # 评估后清理GPU缓存
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                
+                # 定期清理GPU缓存（每个log_interval步）
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             postfix = {
                 "loss": f"{loss.item():.4f}",
@@ -1013,6 +1040,11 @@ def train(
                     postfix["bp_int"] = bp_interval
 
             pbar.set_postfix(postfix)
+        
+        # 每个epoch结束后清理GPU缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         if logger:
             logger.info("Epoch %s/%s completed", epoch + 1, epochs)
 
@@ -1070,7 +1102,10 @@ def train(
                 train_loss=last_metrics['loss'],
                 checkpoint_path=str(final_snapshot_path),
                 checkpoint_type="snapshot",
-        )
+            )
+            # 评估后清理GPU缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     if logger:
         logger.info("Training complete. Total steps: %s", step)

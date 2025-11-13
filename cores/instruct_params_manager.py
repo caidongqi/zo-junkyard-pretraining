@@ -50,10 +50,10 @@ class InstructParamsManager:
         self,
         loss_threshold=LOSS_THRESHOLD,
         loss_step=LOSS_STEP,
-        target_initial=TARGET_INITIAL,
+        target_initial=None,  # 如果为None，使用默认值TARGET_INITIAL
         target_increment=TARGET_INCREMENT,
         target_max=TARGET_MAX,
-        scale_initial=SCALE_INITIAL,
+        scale_initial=None,  # 如果为None，使用默认值SCALE_INITIAL
         scale_decrement=SCALE_DECREMENT,
         scale_min=SCALE_MIN,
     ):
@@ -63,19 +63,21 @@ class InstructParamsManager:
         Args:
             loss_threshold: Loss value below which adjustments begin
             loss_step: Loss decrease required for one adjustment step
-            target_initial: Initial cosine target value
+            target_initial: Initial cosine target value (if None, uses TARGET_INITIAL default)
             target_increment: Amount to increase target per step
             target_max: Maximum cosine target value
-            scale_initial: Initial noise scale value
+            scale_initial: Initial noise scale value (if None, uses SCALE_INITIAL default)
             scale_decrement: Amount to decrease scale per step
             scale_min: Minimum noise scale value
         """
         self.loss_threshold = loss_threshold
         self.loss_step = loss_step
-        self.target_initial = target_initial
+        # 如果target_initial为None，使用默认值；否则使用传入的值
+        self.target_initial = target_initial if target_initial is not None else TARGET_INITIAL
         self.target_increment = target_increment
         self.target_max = target_max
-        self.scale_initial = scale_initial
+        # 如果scale_initial为None，使用默认值；否则使用传入的值
+        self.scale_initial = scale_initial if scale_initial is not None else SCALE_INITIAL
         self.scale_decrement = scale_decrement
         self.scale_min = scale_min
         

@@ -287,6 +287,9 @@ def get_dataloader(
     if config['streaming']:
         load_kwargs['streaming'] = True
     
+    # 优先使用本地缓存，如果不存在才下载
+    load_kwargs['download_mode'] = 'reuse_cache_if_exists'
+    
     dataset = load_dataset(**load_kwargs)
     
     # 如果设置了最大样本数且使用流式加载，则截取
