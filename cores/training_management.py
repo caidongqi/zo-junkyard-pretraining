@@ -158,13 +158,16 @@ class CheckpointManager:
             delta = self.snapshot_delta_2
         else:
             delta = self.snapshot_delta
-        loss_improved = loss_value <= self.best_loss - delta
+        # 条件1：损失是否有“显著”下降
+        significant_improvement = loss_value <= self.best_loss - delta
+        
+        # 条件2：是否达到了步数间隔
+        periodic_checkpoint_due = self._interval_ok(save_step, self._last_snapshot_step)
 
-        if not force:
-            if not loss_improved:
-                return None
-            if not self._interval_ok(save_step, self._last_snapshot_step):
-                return None
+        should_save = significant_improvement or periodic_checkpoint_due
+
+        if not force and not should_save:
+            return None
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         snapshot_name = f"step{metadata.get('step', 'na')}_loss{loss_value:.4f}_{timestamp}"
