@@ -5,7 +5,7 @@
 
 # 不要使用 set -e，因为我们需要手动处理错误
 # set -e  # 遇到错误立即退出
-export HF_ENDPOINT=https://hf-mirror.com
+# export HF_ENDPOINT=https://hf-mirror.com
 
 # 颜色定义
 RED='\033[0;31m'

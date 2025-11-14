@@ -5,7 +5,7 @@
 
 # 不要使用 set -e，因为我们需要手动处理错误
 # set -e  # 遇到错误立即退出
-export HF_ENDPOINT=https://hf-mirror.com
+# export HF_ENDPOINT=https://hf-mirror.com
 
 # 颜色定义
 RED='\033[0;31m'
@@ -24,7 +24,7 @@ CLEANUP_DONE=false
 # 默认配置参数
 MODES=("FO" "ZO") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
-BATCH_SIZES=(4) # 可以任意调大，只要符合内存就行
+BATCH_SIZES=(8) # 可以任意调大，只要符合内存就行
 GRADIENT_ACCUMULATION_STEPS=32 # 梯度累积步数，1表示不使用梯度累积
 BLOCK_SIZES=(512)  # 序列长度 (可选: 64, 128, 256, 512, 1024)
 QUERY_BUDGETS=(4)
