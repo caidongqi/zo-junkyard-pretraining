@@ -102,37 +102,14 @@ def zo_gradient_estimator(
     device,
     manual_directions=None,
     data_provider=None,
-    parallel_q_computation=False,
-    parallel_batch_size=4,
 ):
-    """
-    ZO梯度估计器，支持可迭代的手动方向序列，可选地为每个查询提供独立数据。
-    
-    Args:
-        model: 模型
-        trainable_params: 可训练参数列表
-        loss_fn: 损失函数
-        inputs: 输入数据
-        labels: 标签数据
-        q: 查询次数
-        epsilon: 扰动大小
-        device: 设备
-        manual_directions: 手动指定的方向（可选）
-        data_provider: 数据提供器（可选）
-        parallel_q_computation: 是否并行计算Q值（内存优化版本）
-        parallel_batch_size: 并行计算时的批次大小
-    """
+    """ZO梯度估计器，支持可迭代的手动方向序列，可选地为每个查询提供独立数据。"""
     # 关闭dropout，加速且去噪
     was_training = model.training
     model.eval()
 
-    # 内存优化：只备份参数引用，使用in-place恢复
-    original_data = []
-    for p in trainable_params:
-        original_data.append(p.data)
-    
-    # 创建临时存储用于参数恢复（仅在需要时分配）
-    temp_storage = None
+    # 记录可训练参数的原值
+    original = [p.data.clone() for p in trainable_params]
 
     def compute_loss(batch_inputs, batch_labels):
         logits = model(batch_inputs).logits
@@ -151,12 +128,6 @@ def zo_gradient_estimator(
         if batch_labels.device != device:
             batch_labels = batch_labels.to(device)
         return batch_inputs, batch_labels
-    
-    def restore_params():
-        """高效地恢复参数到原始值"""
-        for p, orig in zip(trainable_params, original_data):
-            if p.data is not orig:
-                p.data = orig
 
     # 计算原始参数位置的loss（用于记录）
     batch_inputs, batch_labels = get_batch()
@@ -190,18 +161,16 @@ def zo_gradient_estimator(
 
             batch_inputs, batch_labels = get_batch()
 
-            # 内存优化：使用add_而不是创建新tensor
-            for p, d in zip(trainable_params, direction):
-                p.data.add_(epsilon * d)
+            for p, p0, d in zip(trainable_params, original, direction):
+                p.data = p0 + epsilon * d
             loss_pos = compute_loss(batch_inputs, batch_labels)
 
-            # 恢复并扰动到负方向
-            for p, orig, d in zip(trainable_params, original_data, direction):
-                p.data = orig - epsilon * d
+            for p, p0, d in zip(trainable_params, original, direction):
+                p.data = p0 - epsilon * d
             loss_neg = compute_loss(batch_inputs, batch_labels)
 
-            # 恢复原始参数
-            restore_params()
+            for p, p0 in zip(trainable_params, original):
+                p.data = p0.clone()
 
             proj = (loss_pos - loss_neg) / (2 * epsilon)
             for gi, d in enumerate(direction):
@@ -214,60 +183,43 @@ def zo_gradient_estimator(
     if q is not None:
         remaining_q = max(q - manual_used, 0)
 
-    # 随机方向部分
-    if remaining_q > 0:
-        if parallel_q_computation:
-            # 并行计算版本：批量处理多个方向
-            _compute_random_directions_parallel(
-                trainable_params, original_data, compute_loss, get_batch,
-                remaining_q, epsilon, grads, parallel_batch_size
-            )
-            used_directions += remaining_q
-        else:
-            # 原始顺序版本（内存优化）
-            seeds = []
-            proj_grads = []
-            for _ in range(remaining_q):
-                seed = torch.randint(0, 2**31 - 1, ()).item()
-                seeds.append(seed)
+    # 随机方向部分，继续使用种子以节省显存
+    seeds = []
+    proj_grads = []
+    for _ in range(remaining_q):
+        seed = torch.randint(0, 2**31 - 1, ()).item()
+        seeds.append(seed)
 
-                batch_inputs, batch_labels = get_batch()
+        batch_inputs, batch_labels = get_batch()
 
-                torch.manual_seed(seed)
-                for p, orig in zip(trainable_params, original_data):
-                    z = torch.randn_like(p.data)
-                    p.data = orig + epsilon * z
-                loss_pos = compute_loss(batch_inputs, batch_labels)
+        torch.manual_seed(seed)
+        for p in trainable_params:
+            z = torch.randn_like(p.data)
+            p.data = p.data + epsilon * z
+        loss_pos = compute_loss(batch_inputs, batch_labels)
 
-                torch.manual_seed(seed)
-                for p, orig in zip(trainable_params, original_data):
-                    z = torch.randn_like(p.data)
-                    p.data = orig - epsilon * z
-                loss_neg = compute_loss(batch_inputs, batch_labels)
+        torch.manual_seed(seed)
+        for p, p0 in zip(trainable_params, original):
+            z = torch.randn_like(p.data)
+            p.data = p0 - epsilon * z
+        loss_neg = compute_loss(batch_inputs, batch_labels)
 
-                # 恢复参数
-                restore_params()
+        for p, p0 in zip(trainable_params, original):
+            p.data = p0.clone()
 
-                proj_grads.append(((loss_pos - loss_neg) / (2 * epsilon)).item())
-                
-                # 清理显存（每个query后）
-                if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
-                    torch.cuda.empty_cache()
+        proj_grads.append(((loss_pos - loss_neg) / (2 * epsilon)).item())
 
-            # 重建随机方向贡献
-            for seed, proj in zip(seeds, proj_grads):
-                torch.manual_seed(seed)
-                for gi, p in enumerate(trainable_params):
-                    z = torch.randn_like(p.data)
-                    grads[gi].add_(proj * z)
-                used_directions += 1
+    # 重建随机方向贡献
+    for seed, proj in zip(seeds, proj_grads):
+        torch.manual_seed(seed)
+        for gi, p in enumerate(trainable_params):
+            z = torch.randn_like(p.data)
+            grads[gi].add_(proj * z)
+        used_directions += 1
 
     if used_directions > 0:
         for gi in range(len(grads)):
             grads[gi].div_(float(used_directions))
-
-    # 确保参数已恢复
-    restore_params()
 
     if was_training:
         model.train()
@@ -478,6 +430,8 @@ def train(
             checkpoint_path,
             logger=logger,
             snapshot_delta=snapshot_delta,
+            best_loss=10.5,
+            save_interval_steps=1000,
         )
 
     evaluation_manager = None
@@ -566,27 +520,6 @@ def train(
         print("ZO queries will use fresh data batches per direction.")
         if logger:
             logger.info("ZO queries will use fresh data batches per direction.")
-
-    # 为BP创建单独的batch provider（如果使用单独的数据集）
-    bp_batch_provider = None
-    if bp_dataloader is not None:
-        bp_iter = iter(bp_dataloader)
-
-        def _next_bp_batch():
-            nonlocal bp_iter
-            try:
-                batch = next(bp_iter)
-            except StopIteration:
-                bp_iter = iter(bp_dataloader)
-                batch = next(bp_iter)
-            batch = batch.to(device)
-            labels = batch.clone()
-            return batch, labels
-
-        bp_batch_provider = _next_bp_batch
-        print(f"BP will use separate dataset: {bp_dataset_name}")
-        if logger:
-            logger.info("BP will use separate dataset: %s", bp_dataset_name)
 
     if mode in {'Calibrate', 'Instruct'}:
         if bp_interval is None or bp_interval <= 0:
@@ -682,6 +615,8 @@ def train(
     batches_per_epoch = len(dataloader)
     total_optimization_steps = (batches_per_epoch * epochs) // gradient_accumulation_steps
     total_steps = total_optimization_steps  # 用于LR调度器
+
+    print(f"Total optimization steps (considering gradient accumulation): {total_optimization_steps}")
     
     last_metrics = {
         'loss': None,
@@ -726,38 +661,55 @@ def train(
 
             grad_norm = 0.0  # 默认值
             
-            if mode == 'FO':
-                if accumulation_counter == 0:
-                    if hasattr(optimizer, 'zero_grad'):
-                        optimizer.zero_grad()
-                    else:
-                        for p in trainable_params:
-                            if p.grad is not None:
-                                p.grad.zero_()
-
-                logits = model(inputs).logits
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss = loss_fn(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1)
-                )
-
-                loss_value = loss.item()
-                (loss / gradient_accumulation_steps).backward()
-
-                accumulation_counter += 1
-                accumulated_loss += loss_value
-                should_update = (accumulation_counter >= gradient_accumulation_steps)
-
-                if should_update:
-                    grad_norm_sq = 0.0
+            
+            if accumulation_counter == 0:
+                if hasattr(optimizer, 'zero_grad'):
+                    optimizer.zero_grad()
+                else:
                     for p in trainable_params:
                         if p.grad is not None:
-                            grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
-                    grad_norm = math.sqrt(grad_norm_sq)
-                    
-                    optimizer.step()
+                            p.grad.zero_()
+
+            logits = model(inputs).logits
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+
+            loss_value = loss.item()
+            (loss / gradient_accumulation_steps).backward()
+
+            accumulation_counter += 1
+            accumulated_loss += loss_value
+            should_update = (accumulation_counter >= gradient_accumulation_steps)
+
+            if should_update: # enough accumulation
+                grad_norm_sq = 0.0
+                for p in trainable_params:
+                    if p.grad is not None:
+                        grad_norm_sq += float(torch.sum(p.grad.detach() * p.grad.detach()).item())
+                grad_norm = math.sqrt(grad_norm_sq)
+
+                # 模仿instruct里面的bp
+                grads = []
+                for p in trainable_params:
+                    if p.grad is None:
+                        grads.append(torch.zeros_like(p.data))
+                    else:
+                        grads.append(p.grad.detach().clone())
+                # print(grads[0])
+                # print(grad_norm)
+                avg_loss = accumulated_loss / accumulation_counter
+                loss = torch.tensor(avg_loss, device=device)
+
+                accumulation_counter = 0
+                accumulated_loss = 0.0
+
+                if mode == 'FO' or q is None or q <= 0:    
+                    optimizer.step(grads=grads)
+                    # print(grads)
 
                     if hasattr(optimizer, 'zero_grad'):
                         optimizer.zero_grad()
@@ -766,160 +718,131 @@ def train(
                             if p.grad is not None:
                                 p.grad.zero_()
 
-                    avg_loss = accumulated_loss / accumulation_counter
-                    loss = torch.tensor(avg_loss, device=device)
-
-                    accumulation_counter = 0
-                    accumulated_loss = 0.0
-
                     step += 1
-                else:
-                    continue
             
-            elif mode in zo_like_modes:
-                # ZO模式：每个batch都是一次优化步骤
-                should_use_bp = (
-                    mode in {'Calibrate', 'Instruct'}
-                    and bp_interval is not None
-                    and bp_interval > 0
-                    and ((step + 1) % bp_interval == 0)
-                )
-
-                bp_grads = None
-                if should_use_bp:
-                    # 在计算BP梯度前清理显存
-                    if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
-                        torch.cuda.empty_cache()
-                    
-                    # 如果有单独的BP数据集，则使用它；否则使用当前训练batch
-                    if bp_batch_provider is not None:
-                        bp_inputs, bp_labels = bp_batch_provider()
-                        _, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, bp_inputs, bp_labels)
-                    else:
-                        _, bp_grads = compute_backprop_gradients(model, trainable_params, loss_fn, inputs, labels)
-                    
+                elif mode in zo_like_modes:
+                    # ZO模式：每个batch都是一次优化步骤
+                
+                    bp_grads = grads
+                        
                     # 计算BP梯度后清理显存
                     if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
                         torch.cuda.empty_cache()
 
-                epsilon = 1e-4  # 增大扰动大小以提高数值稳定性
+                    epsilon = 1e-4  # 增大扰动大小以提高数值稳定性
 
-                manual_dirs = None
-                if mode == 'Instruct' and should_use_bp and bp_grads is not None:
-                    # 动态获取当前的 instruct 参数（基于最新的 loss）
-                    current_cosine_target = instruct_cosine_target
-                    current_noise_scale = instruct_noise_scale
-                    
-                    if instruct_params_manager is not None and losses:
-                        # 使用当前的平均 loss 来更新参数
-                        recent_loss = sum(losses[-10:]) / len(losses[-10:]) if len(losses) >= 10 else sum(losses) / len(losses)
-                        current_cosine_target, current_noise_scale = instruct_params_manager.get_params(recent_loss)
-                        # 更新 last_metrics 以便记录
-                        last_metrics['current_cosine_target'] = current_cosine_target
-                        last_metrics['current_noise_scale'] = current_noise_scale
-                    
-                    manual_dirs = generate_instruct_directions_hybrid(
-                        bp_grads=bp_grads,
-                        q=q,
-                        cosine_target=current_cosine_target,
-                        noise_scale=current_noise_scale,
-                        device=device,
+                    manual_dirs = None
+                    if mode == 'Instruct' and bp_grads is not None:
+                        # 动态获取当前的 instruct 参数（基于最新的 loss）
+                        current_cosine_target = instruct_cosine_target
+                        current_noise_scale = instruct_noise_scale
+                        
+                        if instruct_params_manager is not None and losses:
+                            # 使用当前的平均 loss 来更新参数
+                            recent_loss = sum(losses[-10:]) / len(losses[-10:]) if len(losses) >= 10 else sum(losses) / len(losses)
+                            current_cosine_target, current_noise_scale = instruct_params_manager.get_params(recent_loss)
+                            # 更新 last_metrics 以便记录
+                            last_metrics['current_cosine_target'] = current_cosine_target
+                            last_metrics['current_noise_scale'] = current_noise_scale
+                        
+                        manual_dirs = generate_instruct_directions_hybrid(
+                            bp_grads=bp_grads,
+                            q=q,
+                            cosine_target=current_cosine_target,
+                            noise_scale=current_noise_scale,
+                            device=device,
+                        )
+                        if manual_dirs is None:
+                            total_norm_sq = 0.0
+                            for g in bp_grads:
+                                total_norm_sq += float(torch.sum(g * g).item())
+                            total_norm = math.sqrt(total_norm_sq)
+                            if total_norm > 0.0:
+                                manual_dirs = ([g / total_norm for g in bp_grads],)
+
+                    grad_paramwise, loss_zo = zo_gradient_estimator(
+                        model,
+                        trainable_params,
+                        loss_fn,
+                        inputs,
+                        labels,
+                        q,
+                        epsilon,
+                        device,
+                        manual_directions=manual_dirs,
+                        data_provider=query_batch_provider
                     )
-                    if manual_dirs is None:
-                        total_norm_sq = 0.0
-                        for g in bp_grads:
-                            total_norm_sq += float(torch.sum(g * g).item())
-                        total_norm = math.sqrt(total_norm_sq)
-                        if total_norm > 0.0:
-                            manual_dirs = ([g / total_norm for g in bp_grads],)
+                    
+                    # ZO梯度估计后立即清理显存
+                    if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
+                        torch.cuda.empty_cache()
 
-                grad_paramwise, loss = zo_gradient_estimator(
-                    model,
-                    trainable_params,
-                    loss_fn,
-                    inputs,
-                    labels,
-                    q,
-                    epsilon,
-                    device,
-                    manual_directions=manual_dirs,
-                    data_provider=query_batch_provider,
-                    parallel_q_computation=parallel_q_computation,
-                    parallel_batch_size=parallel_batch_size,
-                )
-                
-                # ZO梯度估计后立即清理显存
-                if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
-                    torch.cuda.empty_cache()
+                    # 在Instruct模式下，可选择混合BP和ZO梯度
+                    # blend_ratio: 0=纯ZO, 1=纯BP, 0.5=均等混合
+                    if mode == 'Instruct' and blend_ratio > 0 and bp_grads is not None:
+                        grad_paramwise = [
+                            (1 - blend_ratio) * gz + blend_ratio * gb
+                            for gz, gb in zip(grad_paramwise, bp_grads)
+                        ]
+                    
+                    # print(grad_paramwise)
+                    # 清理不再需要的临时变量（释放内存）
+                    # 注意：这些变量在混合梯度后不再需要
+                    try:
+                        if 'manual_dirs' in locals():
+                            del manual_dirs
+                    except:
+                        pass
+                    try:
+                        if 'bp_grads' in locals():
+                            del bp_grads
+                    except:
+                        pass
 
-                # 在Calibrate模式下使用BP梯度
-                if mode == 'Calibrate' and should_use_bp and bp_grads is not None:
-                    grad_paramwise = bp_grads
-                
-                # 在Instruct模式下，可选择混合BP和ZO梯度
-                # blend_ratio: 0=纯ZO, 1=纯BP, 0.5=均等混合
-                if mode == 'Instruct' and blend_ratio > 0 and should_use_bp and bp_grads is not None:
-                    grad_paramwise = [
-                        (1 - blend_ratio) * gz + blend_ratio * gb
-                        for gz, gb in zip(grad_paramwise, bp_grads)
-                    ]
-                
-                # 清理不再需要的临时变量（释放内存）
-                # 注意：这些变量在混合梯度后不再需要
-                try:
-                    if 'manual_dirs' in locals():
-                        del manual_dirs
-                except:
-                    pass
-                try:
-                    if 'bp_grads' in locals():
-                        del bp_grads
-                except:
-                    pass
+                    grad_norm_sq = 0.0
+                    for g in grad_paramwise:
+                        if g is not None:
+                            grad_norm_sq += float(torch.sum(g.detach() * g.detach()).item())
+                    grad_norm = math.sqrt(grad_norm_sq)
 
-                grad_norm_sq = 0.0
-                for g in grad_paramwise:
-                    if g is not None:
-                        grad_norm_sq += float(torch.sum(g.detach() * g.detach()).item())
-                grad_norm = math.sqrt(grad_norm_sq)
+                    if (
+                        mode == 'Instruct'
+                        and grad_clip_norm is not None
+                        and grad_clip_norm > 0
+                        and grad_norm > grad_clip_norm
+                        and step > 20
+                    ):
+                        clip_coef = grad_clip_norm / (grad_norm + 1e-6)
+                        grad_paramwise = [
+                            g * clip_coef if g is not None else None
+                            for g in grad_paramwise
+                        ]
+                        if logger:
+                            logger.info(
+                                "Gradient norm clipped from %.6f to %.6f (max %.6f)",
+                                grad_norm,
+                                grad_norm * clip_coef,
+                                grad_clip_norm,
+                            )
+                        else:
+                            print(
+                                f"Gradient norm clipped from {grad_norm:.6f} to {grad_norm * clip_coef:.6f} "
+                                f"(max {grad_clip_norm:.6f})"
+                            )
+                        grad_norm *= clip_coef
+                        grad_norm_sq *= clip_coef * clip_coef
 
-                if (
-                    mode == 'Instruct'
-                    and grad_clip_norm is not None
-                    and grad_clip_norm > 0
-                    and grad_norm > grad_clip_norm
-                ):
-                    clip_coef = grad_clip_norm / (grad_norm + 1e-6)
-                    grad_paramwise = [
-                        g * clip_coef if g is not None else None
-                        for g in grad_paramwise
-                    ]
-                    if logger:
-                        logger.info(
-                            "Gradient norm clipped from %.6f to %.6f (max %.6f)",
-                            grad_norm,
-                            grad_norm * clip_coef,
-                            grad_clip_norm,
-                        )
-                    else:
-                        print(
-                            f"Gradient norm clipped from {grad_norm:.6f} to {grad_norm * clip_coef:.6f} "
-                            f"(max {grad_clip_norm:.6f})"
-                        )
-                    grad_norm *= clip_coef
-                    grad_norm_sq *= clip_coef * clip_coef
-
-                if optimizer is None: # 手动 SGD 更新
-                    for p, g in zip(trainable_params, grad_paramwise):
-                        if g is None:
-                            continue
-                        p.data -= current_lr * g # 使用动态学习率
-                else: # 使用 Adam 或 MuDaMW
-                    # 优化器的学习率已在循环开始时更新
-                    optimizer.step(grads=grad_paramwise)
-                
-                # ZO模式：每个batch后增加step
-                step += 1
+                    if optimizer is None: # 手动 SGD 更新
+                        for p, g in zip(trainable_params, grad_paramwise):
+                            if g is None:
+                                continue
+                            p.data -= current_lr * g # 使用动态学习率
+                    else: # 使用 Adam 或 MuDaMW
+                        # 优化器的学习率已在循环开始时更新
+                        optimizer.step(grads=grad_paramwise)
+                    
+                    # ZO模式：每个batch后增加step
+                    step += 1
 
             losses.append(loss.item())
             # 限制losses列表大小，防止内存无限增长（只保留最近10000个值）
@@ -934,7 +857,7 @@ def train(
             })
 
             # 记录到CSV / 日志 / checkpoint（每 log_interval 步）
-            should_log_step = (log_interval > 0) and (current_step % log_interval == 0)
+            should_log_step = (log_interval > 0) and (current_step % log_interval == 0) and should_update 
             if should_log_step:
                 timestamp_dt = datetime.now()
                 timestamp = timestamp_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -1028,6 +951,7 @@ def train(
                         tokenizer,
                         optimizer_state=optimizer_state,
                         metadata=base_metadata,
+                        step=current_step,
                     )
 
                     snapshot_path = checkpoint_manager.maybe_save_snapshot(
@@ -1036,6 +960,7 @@ def train(
                         tokenizer,
                         optimizer_state=optimizer_state,
                         metadata=base_metadata,
+                        step=current_step,
                     )
 
                     # 只在保存新的snapshot时才进行evaluation
@@ -1114,6 +1039,8 @@ def train(
             tokenizer,
             optimizer_state=optimizer_state,
             metadata=final_metadata,
+            step=final_step,
+            force=True,
         )
         final_snapshot_path = checkpoint_manager.maybe_save_snapshot(
             last_metrics['loss'],
@@ -1121,6 +1048,8 @@ def train(
             tokenizer,
             optimizer_state=optimizer_state,
             metadata=final_metadata,
+            step=final_step,
+            force=True,
         )
         # 只在保存新的snapshot时才进行evaluation
         if evaluation_manager and final_snapshot_path is not None:
@@ -1193,7 +1122,7 @@ if __name__ == "__main__":
                         help="Tokenization block size for downstream evaluation (default: 256).")
     
     # 模型和数据集参数
-    parser.add_argument("--model_size", type=str, default='20M', 
+    parser.add_argument("--model_size", type=str, default='500M', 
                         choices=['20M', '200M', '500M', '1B'],
                         help="Model size: 20M (fast), 200M (GPT-2 Small), 500M (medium), 1B (large).")
     parser.add_argument("--dataset", type=str, default='cosmopedia-100k',

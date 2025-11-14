@@ -26,6 +26,7 @@ class CheckpointManager:
         snapshot_delta_2: float = 0.1,
         turning_point: float = 4.5,
         best_loss: float = 1e9,
+        save_interval_steps: int = 1000,
     ):
         self.logger = logger
         self.snapshot_delta = snapshot_delta
@@ -33,6 +34,9 @@ class CheckpointManager:
         self.turning_point = turning_point
         self.base_dir = Path(base_dir) if base_dir else None
         self.best_loss: Optional[float] = best_loss  # Track the global best (lowest) loss
+        self.save_interval_steps = max(1, int(save_interval_steps))
+        self._last_latest_step: Optional[int] = None
+        self._last_snapshot_step: Optional[int] = None
 
         if self.base_dir:
             self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -82,14 +86,26 @@ class CheckpointManager:
         if isinstance(best_loss, (int, float)):
             self.best_loss = float(best_loss)
 
+    def _interval_ok(self, step: Optional[int], last_step: Optional[int]) -> bool:
+        if step is None or last_step is None:
+            return True
+        return (step - last_step) >= self.save_interval_steps
+
     def save_latest(
         self,
         model,
         tokenizer,
         optimizer_state: Optional[Dict[str, Any]],
         metadata: Dict[str, Any],
+        *,
+        step: Optional[int] = None,
+        force: bool = False,
     ) -> Optional[Path]:
         if self.base_dir is None:
+            return None
+
+        save_step = step if step is not None else metadata.get("step")
+        if not force and not self._interval_ok(save_step, self._last_latest_step):
             return None
 
         metadata = dict(metadata)  # copy
@@ -99,6 +115,8 @@ class CheckpointManager:
         latest_dir = self.base_dir / "latest"
         saved_path = self._write_checkpoint(latest_dir, model, tokenizer, optimizer_state, metadata)
         self._log(f"Latest checkpoint saved to {saved_path}")
+        if save_step is not None:
+            self._last_latest_step = save_step
         return saved_path
 
     def maybe_save_snapshot(
@@ -108,24 +126,27 @@ class CheckpointManager:
         tokenizer,
         optimizer_state: Optional[Dict[str, Any]],
         metadata: Dict[str, Any],
+        *,
+        step: Optional[int] = None,
+        force: bool = False,
     ) -> Optional[Path]:
         if self.base_dir is None:
             return None
 
-        # Only save if loss is lower than best_loss by snapshot_delta
-        should_save = False
+        save_step = step if step is not None else metadata.get("step")
 
         # Use different snapshot delta based on turning point
         if loss_value <= self.turning_point:
             delta = self.snapshot_delta_2
         else:
             delta = self.snapshot_delta
-        if loss_value <= self.best_loss - delta:
-            # Loss has decreased by at least the applicable snapshot_delta from the global best
-            should_save = True
+        loss_improved = loss_value <= self.best_loss - delta
 
-        if not should_save:
-            return None
+        if not force:
+            if not loss_improved:
+                return None
+            if not self._interval_ok(save_step, self._last_snapshot_step):
+                return None
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         snapshot_name = f"step{metadata.get('step', 'na')}_loss{loss_value:.4f}_{timestamp}"
@@ -141,6 +162,8 @@ class CheckpointManager:
         )
         self.best_loss = loss_value
         self._log(f"Snapshot checkpoint saved to {saved_path} (new best loss: {loss_value:.4f})")
+        if save_step is not None:
+            self._last_snapshot_step = save_step
         return saved_path
 
 

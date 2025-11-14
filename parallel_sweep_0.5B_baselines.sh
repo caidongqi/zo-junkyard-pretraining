@@ -5,6 +5,7 @@
 
 # 不要使用 set -e，因为我们需要手动处理错误
 # set -e  # 遇到错误立即退出
+export HF_ENDPOINT=https://hf-mirror.com
 
 # 颜色定义
 RED='\033[0;31m'
@@ -21,16 +22,17 @@ PID_FILE=""
 CLEANUP_DONE=false
 
 # 默认配置参数
-MODES=("FO" "ZO") # 可选: FO, ZO, Calibrate, Instruct
+MODES=("Instruct") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
-BATCH_SIZES=(4) # 可以任意调大，只要符合内存就行
-GRADIENT_ACCUMULATION_STEPS=8  # 梯度累积步数，1表示不使用梯度累积
+BATCH_SIZES=(16) # ！！不可以调大
+GRADIENT_ACCUMULATION_STEPS=4  # 梯度累积步数，1表示不使用梯度累积
 BLOCK_SIZES=(512)  # 序列长度 (可选: 64, 128, 256, 512, 1024)
-QUERY_BUDGETS=(8)
+QUERY_BUDGETS=(4)
 BP_INTERVALS=(1)
-BLEND_RATIOS=(0.1 0.2 0.5 0.9)  # Instruct模式梯度混合比例: 0.0=纯ZO, 1.0=纯BP, 0.5=均等混合
-INSTRUCT_COSINE_TARGETS=(0.01)
-INSTRUCT_NOISE_SCALES=(10.0)
+BLEND_RATIOS=(0.8)  # Instruct模式梯度混合比例: 0.0=纯ZO, 1.0=纯BP, 0.5=均等混合
+INSTRUCT_COSINE_TARGETS=(0.95)
+INSTRUCT_NOISE_SCALES=(0.1)
+GRAD_CLIP_NORMS=("")  # Instruct模式梯度裁剪阈值，留空表示不启用
 LEARNING_RATES_ZO=(1e-3)
 OPTIMIZERS=("mudamw")  # 可选: sgd, adam, mudamw
 EPOCHS=1
@@ -84,7 +86,7 @@ BP_MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字
 
 # 并行配置
 MAX_PARALLEL_JOBS=32 # 最大并行任务数
-GPU_IDS="4"           # GPU ID列表，空表示自动检测
+GPU_IDS="1"           # GPU ID列表，空表示自动检测
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -169,6 +171,10 @@ while [[ $# -gt 0 ]]; do
             IFS=',' read -ra INSTRUCT_NOISE_SCALES <<< "$2"
             shift 2
             ;;
+        --grad-clip-norms)
+            IFS=',' read -ra GRAD_CLIP_NORMS <<< "$2"
+            shift 2
+            ;;
         --use-lr-scheduler)
             USE_LR_SCHEDULER=true
             shift 1
@@ -229,6 +235,7 @@ while [[ $# -gt 0 ]]; do
             echo "                       0.0=纯ZO, 1.0=纯BP, 0.5=均等混合"
             echo "  --instruct-cosine-targets '0.9,0.95'   Instruct模式的余弦目标 (默认: 0.9)"
             echo "  --instruct-noise-scales '0.5,1.0'      Instruct模式的噪声强度 (默认: 0.5)"
+            echo "  --grad-clip-norms '5,10'               Instruct模式梯度裁剪阈值，留空或负值表示禁用"
             echo "  --use-lr-scheduler   启用余弦退火学习率调度器 (默认: 启用)"
             echo "  --no-lr-scheduler    禁用学习率调度器"
             echo "  --warmup-steps N     学习率预热步数 (默认: 300)"
@@ -268,7 +275,7 @@ fi
 
 # 创建日志与结果目录
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RUN_DESCRIPTOR="${MODES}_${SCOPES}_${BATCH_SIZES}_${QUERY_BUDGETS}_${BP_INTERVALS}_${BLEND_RATIOS}_${LEARNING_RATES_ZO}_${OPTIMIZERS}_${EPOCHS}_${LOG_INTERVAL}_${INSTRUCT_COSINE_TARGETS}_${INSTRUCT_NOISE_SCALES}"
+RUN_DESCRIPTOR="${MODES}_${SCOPES}_${BATCH_SIZES}_${QUERY_BUDGETS}_${BP_INTERVALS}_${BLEND_RATIOS}_${LEARNING_RATES_ZO}_${OPTIMIZERS}_${EPOCHS}_${LOG_INTERVAL}_${INSTRUCT_COSINE_TARGETS}_${INSTRUCT_NOISE_SCALES}_${GRAD_CLIP_NORMS}"
 mkdir -p "$LOGS_ROOT"
 RUN_LOG_ROOT="${LOGS_ROOT}/parallel_sweep_${TIMESTAMP}"
 EXPERIMENT_LOG_ROOT="${RUN_LOG_ROOT}/experiments"
@@ -394,13 +401,13 @@ generate_experiments() {
                         for optimizer in "${OPTIMIZERS[@]}"; do
                             if [ "$mode" = "FO" ]; then
                                 for lr in "${LEARNING_RATES_ZO[@]}"; do
-                                    experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:N/A:$lr:$optimizer:N/A:$model_size:N/A:N/A:N/A")
+                                    experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:N/A:$lr:$optimizer:N/A:$model_size:N/A:N/A:N/A:N/A")
                                     exp_id=$((exp_id + 1))
                                 done
                             elif [ "$mode" = "ZO" ]; then
                                 for q in "${QUERY_BUDGETS[@]}"; do
                                     for lr in "${LEARNING_RATES_ZO[@]}"; do
-                                        experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:N/A:$model_size:N/A:N/A:N/A")
+                                        experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:N/A:$model_size:N/A:N/A:N/A:N/A")
                                         exp_id=$((exp_id + 1))
                                     done
                                 done
@@ -411,8 +418,14 @@ generate_experiments() {
                                             for blend_ratio in "${BLEND_RATIOS[@]}"; do
                                                 for cos_target in "${INSTRUCT_COSINE_TARGETS[@]}"; do
                                                     for noise_scale in "${INSTRUCT_NOISE_SCALES[@]}"; do
-                                                        experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:$blend_ratio:$cos_target:$noise_scale")
-                                                        exp_id=$((exp_id + 1))
+                                                        for grad_clip in "${GRAD_CLIP_NORMS[@]}"; do
+                                                            grad_clip_value="$grad_clip"
+                                                            if [ -z "$grad_clip_value" ]; then
+                                                                grad_clip_value="N/A"
+                                                            fi
+                                                            experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:$blend_ratio:$cos_target:$noise_scale:$grad_clip_value")
+                                                            exp_id=$((exp_id + 1))
+                                                        done
                                                     done
                                                 done
                                             done
@@ -423,7 +436,7 @@ generate_experiments() {
                                 for q in "${QUERY_BUDGETS[@]}"; do
                                     for lr in "${LEARNING_RATES_ZO[@]}"; do
                                         for bp_interval in "${BP_INTERVALS[@]}"; do
-                                            experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:N/A:N/A:N/A")
+                                            experiments+=("$exp_id:$mode:$scope:$batch_size:$block_size:$q:$lr:$optimizer:$bp_interval:$model_size:N/A:N/A:N/A:N/A")
                                             exp_id=$((exp_id + 1))
                                         done
                                     done
@@ -444,7 +457,7 @@ run_single_experiment() {
     local exp_config="$1"
     local gpu_id="$2"
     
-    IFS=':' read -r exp_id mode scope batch_size block_size q lr optimizer bp_interval model_size blend_ratio cos_target noise_scale <<< "$exp_config"
+    IFS=':' read -r exp_id mode scope batch_size block_size q lr optimizer bp_interval model_size blend_ratio cos_target noise_scale grad_clip <<< "$exp_config"
     
     # 将 N/A 替换为 NA 以避免文件路径问题
     local q_safe="${q//\//_}"
@@ -455,6 +468,7 @@ run_single_experiment() {
     local blend_label=""
     local cos_label=""
     local noise_label=""
+    local grad_clip_label=""
     if [ "$blend_ratio" != "N/A" ]; then
         blend_label="_blend${blend_safe}"
     fi
@@ -464,7 +478,10 @@ run_single_experiment() {
     if [ "$noise_scale" != "N/A" ]; then
         noise_label="_ns${noise_safe}"
     fi
-    local exp_name="${mode}_${model_size}_${scope}_bs${batch_size}_blk${block_size}_q${q_safe}_bp${bp_safe}_opt${optimizer}_lr${lr}${blend_label}${cos_label}${noise_label}"
+    if [ "$grad_clip" != "N/A" ]; then
+        grad_clip_label="_gc${grad_clip_safe}"
+    fi
+    local exp_name="${mode}_${model_size}_${scope}_bs${batch_size}_blk${block_size}_q${q_safe}_bp${bp_safe}_opt${optimizer}_lr${lr}${blend_label}${cos_label}${noise_label}${grad_clip_label}"
     local csv_file="${CSV_DIR}/${exp_name}.csv"
     local job_log="${JOB_LOG_DIR}/${exp_name}.log"
     local exp_log_dir="${EXPERIMENT_LOG_ROOT}/${exp_name}"
@@ -520,6 +537,9 @@ run_single_experiment() {
     if [ "$mode" = "Instruct" ] && [ "$noise_scale" != "N/A" ]; then
         cmd="$cmd --instruct_noise_scale $noise_scale"
     fi
+    if [ "$mode" = "Instruct" ] && [ "$grad_clip" != "N/A" ]; then
+        cmd="$cmd --grad_clip_norm $grad_clip"
+    fi
     
     # 学习率调度器参数
     if [ "$USE_LR_SCHEDULER" = true ]; then
@@ -558,6 +578,7 @@ run_single_experiment() {
         echo "Instruct blend ratio: $blend_ratio" >> "$job_log"
         echo "Instruct cosine target: $cos_target" >> "$job_log"
         echo "Instruct noise scale: $noise_scale" >> "$job_log"
+        echo "Instruct grad clip norm: ${grad_clip:-N/A}" >> "$job_log"
     fi
     echo "Start time: $(date)" >> "$job_log"
     echo "----------------------------------------" >> "$job_log"
