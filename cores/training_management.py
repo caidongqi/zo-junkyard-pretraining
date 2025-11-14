@@ -7,6 +7,24 @@ from typing import Optional, Dict, Any, Iterable
 
 import torch
 
+# 放在文件顶部
+import signal
+import platform
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any, Iterable
+# 假设 torch, math, etc. 已经导入
+
+# 为超时定义自定义异常和处理器（放在类定义之外）
+class EvaluationTimeoutError(Exception):
+    """Custom exception for evaluation timeout."""
+    pass
+
+def _timeout_handler(signum, frame):
+    """Raises EvaluationTimeoutError when the alarm signal is received."""
+    raise EvaluationTimeoutError
+
 
 class CheckpointManager:
     """
@@ -355,6 +373,7 @@ class EvaluationManager:
         
         return correct_predictions / total_samples
 
+    # 这是 EvaluationManager 类中的一个方法
     def evaluate(
         self,
         model,
@@ -378,49 +397,86 @@ class EvaluationManager:
             "checkpoint_type": checkpoint_type,
         }
 
-        try:
-            metrics["sst2_perplexity"] = self._compute_perplexity(
-                model, tokenizer, self._prepare_texts("sst2")
-            )
-        except Exception as err:
-            metrics["sst2_error"] = str(err)
-            self._log(f"SST-2 evaluation failed: {err}", level="warning")
+        timeout_seconds = 60  # 1分钟
+        evaluation_completed = False
+
+        # signal.alarm 在 Windows 上不可用
+        is_windows = platform.system() == "Windows"
+        if not is_windows:
+            original_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(timeout_seconds)
 
         try:
-            metrics["squad_perplexity"] = self._compute_perplexity(
-                model, tokenizer, self._prepare_texts("squad")
-            )
-        except Exception as err:
-            metrics["squad_error"] = str(err)
-            self._log(f"SQuAD evaluation failed: {err}", level="warning")
+            # ------------------- 评估逻辑开始（受超时限制）------------------- #
+            try:
+                metrics["sst2_perplexity"] = self._compute_perplexity(
+                    model, tokenizer, self._prepare_texts("sst2")
+                )
+            except Exception as err:
+                if isinstance(err, EvaluationTimeoutError): raise  # 重新抛出，由外部块处理
+                metrics["sst2_error"] = str(err)
+                self._log(f"SST-2 evaluation failed: {err}", level="warning")
+
+            try:
+                metrics["squad_perplexity"] = self._compute_perplexity(
+                    model, tokenizer, self._prepare_texts("squad")
+                )
+            except Exception as err:
+                if isinstance(err, EvaluationTimeoutError): raise
+                metrics["squad_error"] = str(err)
+                self._log(f"SQuAD evaluation failed: {err}", level="warning")
+                
+            try:
+                lambada_texts = list(self._prepare_texts("lambada"))
+                metrics["lambada_perplexity"] = self._compute_perplexity(
+                    model, tokenizer, lambada_texts
+                )
+                metrics["lambada_accuracy"] = self._compute_accuracy_lambada(
+                    model, tokenizer, lambada_texts
+                )
+            except Exception as err:
+                if isinstance(err, EvaluationTimeoutError): raise
+                metrics["lambada_error"] = str(err)
+                self._log(f"LAMBADA evaluation failed: {err}", level="warning")
             
-        # [新增] 对 LAMBADA 进行评估
-        try:
-            lambada_texts = list(self._prepare_texts("lambada"))
-            metrics["lambada_perplexity"] = self._compute_perplexity(
-                model, tokenizer, lambada_texts
-            )
-            metrics["lambada_accuracy"] = self._compute_accuracy_lambada(
-                model, tokenizer, lambada_texts
-            )
-        except Exception as err:
-            metrics["lambada_error"] = str(err)
-            self._log(f"LAMBADA evaluation failed: {err}", level="warning")
+            evaluation_completed = True  # 标记评估已在规定时间内完成
 
+        except EvaluationTimeoutError:
+            # 如果触发了超时，执行此块
+            self._log(
+                f"Evaluation timed out after {timeout_seconds} seconds. "
+                f"Please evaluate the checkpoint at '{checkpoint_path}' later.",
+                level="warning",
+            )
+            metrics["evaluation_status"] = "timed_out"
+        
+        finally:
+            # 无论成功还是超时，都必须取消闹钟并恢复处理器
+            if not is_windows:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, original_handler)
+        
+        # ------------------- 日志记录和文件写入（不受超时限制）------------------- #
+        
+        # 总是将（可能是部分的）指标写入文件
         with self.results_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
 
-        # 更新日志输出以包含 LAMBADA 指标
-        def format_metric(value):
-            return f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
+        # 仅当评估成功完成时，才打印完整的日志消息
+        if evaluation_completed:
+            def format_metric(value):
+                return f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
 
-        log_message = (
-            f"Evaluation recorded at step {step}: "
-            f"SST-2 ppl={format_metric(metrics.get('sst2_perplexity', 'N/A'))}, "
-            f"SQuAD ppl={format_metric(metrics.get('squad_perplexity', 'N/A'))}, "
-            f"LAMBADA ppl={format_metric(metrics.get('lambada_perplexity', 'N/A'))}, "
-            f"LAMBADA acc={format_metric(metrics.get('lambada_accuracy', 'N/A'))}"
-        )
-        self._log(log_message)
-
-        return metrics
+            log_message = (
+                f"Evaluation recorded at step {step}: "
+                f"SST-2 ppl={format_metric(metrics.get('sst2_perplexity', 'N/A'))}, "
+                f"SQuAD ppl={format_metric(metrics.get('squad_perplexity', 'N/A'))}, "
+                f"LAMBADA ppl={format_metric(metrics.get('lambada_perplexity', 'N/A'))}, "
+                f"LAMBADA acc={format_metric(metrics.get('lambada_accuracy', 'N/A'))}"
+            )
+            self._log(log_message)
+            return metrics
+        else:
+            # 如果超时，则返回 None 表示评估未成功完成
+            return None

@@ -22,10 +22,10 @@ PID_FILE=""
 CLEANUP_DONE=false
 
 # 默认配置参数
-MODES=("Instruct") # 可选: FO, ZO, Calibrate, Instruct
+MODES=("FO") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
 BATCH_SIZES=(16) # ！！不可以调大
-GRADIENT_ACCUMULATION_STEPS=4  # 梯度累积步数，1表示不使用梯度累积
+GRADIENT_ACCUMULATION_STEPS=16  # 梯度累积步数，1表示不使用梯度累积
 BLOCK_SIZES=(512)  # 序列长度 (可选: 64, 128, 256, 512, 1024)
 QUERY_BUDGETS=(4)
 BP_INTERVALS=(1)
@@ -86,7 +86,7 @@ BP_MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字
 
 # 并行配置
 MAX_PARALLEL_JOBS=32 # 最大并行任务数
-GPU_IDS="1"           # GPU ID列表，空表示自动检测
+GPU_IDS="0"           # GPU ID列表，空表示自动检测
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -548,8 +548,8 @@ run_single_experiment() {
         cmd="$cmd --min_lr $MIN_LR"
     fi
     
-    # 梯度累积参数（仅FO模式）
-    if [ "$mode" = "FO" ] && [ "$GRADIENT_ACCUMULATION_STEPS" -gt 1 ]; then
+    # 梯度累积参数
+    if [ "$GRADIENT_ACCUMULATION_STEPS" -gt 1 ]; then
         cmd="$cmd --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS"
     fi
     

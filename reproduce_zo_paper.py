@@ -913,7 +913,7 @@ def train(
                     
                     logger.info(log_msg, *log_args)
 
-                if checkpoint_manager:
+                if checkpoint_manager and should_update:
                     optimizer_state = None
                     if optimizer is not None and hasattr(optimizer, 'state_dict'):
                         optimizer_state = optimizer.state_dict()
@@ -963,20 +963,20 @@ def train(
                         step=current_step,
                     )
 
-                    # 只在保存新的snapshot时才进行evaluation
-                    if evaluation_manager and snapshot_path is not None:
-                        evaluation_manager.evaluate(
-                            model,
-                            tokenizer,
-                            step=current_step,
-                            epoch=epoch + 1,
-                            train_loss=float(loss.item()),
-                            checkpoint_path=str(snapshot_path),
-                            checkpoint_type="snapshot",
-                        )
-                        # 评估后清理GPU缓存
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                    # # 只在保存新的snapshot时才进行evaluation
+                    # if evaluation_manager and snapshot_path is not None:
+                    #     evaluation_manager.evaluate(
+                    #         model,
+                    #         tokenizer,
+                    #         step=current_step,
+                    #         epoch=epoch + 1,
+                    #         train_loss=float(loss.item()),
+                    #         checkpoint_path=str(snapshot_path),
+                    #         checkpoint_type="snapshot",
+                    #     )
+                    #     # 评估后清理GPU缓存
+                    #     if torch.cuda.is_available():
+                    #         torch.cuda.empty_cache()
                 
                 # 定期清理GPU缓存（每个log_interval步）
                 if torch.cuda.is_available():
@@ -986,7 +986,8 @@ def train(
                 "loss": f"{loss.item():.4f}",
                 "lr": f"{current_lr:.2e}", # 在进度条中显示当前学习率
                 "grad_norm": f"{grad_norm:.4f}",
-                "opt": optimizer_type
+                "opt": optimizer_type,
+                "current_step": f"{current_step}",
             }
             if mode in zo_like_modes:
                 postfix["queries"] = f"{q}"
