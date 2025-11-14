@@ -963,20 +963,20 @@ def train(
                         step=current_step,
                     )
 
-                    # # 只在保存新的snapshot时才进行evaluation
-                    # if evaluation_manager and snapshot_path is not None:
-                    #     evaluation_manager.evaluate(
-                    #         model,
-                    #         tokenizer,
-                    #         step=current_step,
-                    #         epoch=epoch + 1,
-                    #         train_loss=float(loss.item()),
-                    #         checkpoint_path=str(snapshot_path),
-                    #         checkpoint_type="snapshot",
-                    #     )
-                    #     # 评估后清理GPU缓存
-                    #     if torch.cuda.is_available():
-                    #         torch.cuda.empty_cache()
+                    # 只在保存新的snapshot时才进行evaluation
+                    if evaluation_manager and snapshot_path is not None:
+                        evaluation_manager.evaluate(
+                            model,
+                            tokenizer,
+                            step=current_step,
+                            epoch=epoch + 1,
+                            train_loss=float(loss.item()),
+                            checkpoint_path=str(snapshot_path),
+                            checkpoint_type="snapshot",
+                        )
+                        # 评估后清理GPU缓存
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                 
                 # 定期清理GPU缓存（每个log_interval步）
                 if torch.cuda.is_available():
