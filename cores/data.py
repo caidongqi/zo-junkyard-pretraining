@@ -3,13 +3,13 @@
 定义不同的预训练数据集及其加载方式
 """
 
-import pickle
 from pathlib import Path
 from tqdm import tqdm
+import os
 
 import torch
 from torch.utils.data import DataLoader
-from datasets import load_dataset
+from datasets import load_dataset, Dataset as HFDataset
 
 
 # ============================================================================
@@ -205,10 +205,9 @@ DATASET_CONFIGS = {
 
 
 # ============================================================================
-# 数据加载函数
+# 数据加载函数 (核心修改部分)
 # ============================================================================
 
-#TODO: 加上shuffle seeds，保证Instruct 模式下FO gradient的数据和ZO的不一样
 def get_dataloader(
     tokenizer,
     dataset_name='cosmopedia-100k',
@@ -217,28 +216,15 @@ def get_dataloader(
     max_samples=None,
     cache_dir="cache",
     force_reload=False,
+    num_workers=4,
+    pin_memory=True,
+    prefetch_factor=2,
+    persistent_workers=True,
+    num_proc=None,
 ):
     """
-    加载指定数据集并创建 DataLoader
-    
-    Args:
-        tokenizer: HuggingFace tokenizer
-        dataset_name: 数据集名称，必须在 DATASET_CONFIGS 中定义
-        batch_size: 批次大小
-        block_size: 文本块大小（序列长度）
-        max_samples: 最大样本数，None表示使用推荐值或全部数据
-        cache_dir: 缓存目录
-        force_reload: 是否强制重新加载（忽略缓存）
-    
-    Returns:
-        DataLoader: PyTorch DataLoader 对象
-    
-    Examples:
-        >>> from transformers import AutoTokenizer
-        >>> tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        >>> dataloader = get_dataloader(tokenizer, 'cosmopedia-100k', batch_size=8)
+    加载指定数据集并创建 DataLoader（使用 datasets.save_to_disk 高效缓存）
     """
-    # 验证数据集名称
     if dataset_name not in DATASET_CONFIGS:
         available = ', '.join(DATASET_CONFIGS.keys())
         raise ValueError(
@@ -248,89 +234,112 @@ def get_dataloader(
     
     config = DATASET_CONFIGS[dataset_name]
     
-    # 确定样本数
     if max_samples is None:
         max_samples = config.get('recommended_samples', 20000)
-    
-    # 创建缓存目录
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(exist_ok=True)
-    
-    # 创建缓存文件名（使用 blk 表示 block_size，避免与 batch_size 混淆）
-    # 注意：不同的 batch_size 共用同一个 pkl 文件
-    cache_file = cache_dir / f"dataset_{dataset_name}_blk{block_size}_samples{max_samples}.pkl"
-    
-    # 检查缓存
-    if not force_reload and cache_file.exists():
-        print(f"Loading dataset from cache: {cache_file}")
-        with open(cache_file, 'rb') as f:
-            examples = pickle.load(f)
-        print(f"Dataset loaded from cache. Total samples: {len(examples)}")
-        print(f"Creating DataLoader with batch_size={batch_size}")
-        return DataLoader(examples, batch_size=batch_size, shuffle=True)
-    
-    # 加载数据集
-    print(f"Loading dataset: {dataset_name}")
-    print(f"Description: {config['description']}")
-    print(f"Source: {config['hf_path']}")
-    
-    # 根据配置加载数据集
-    load_kwargs = {
-        'path': config['hf_path'],
-        'split': config['split'],
-    }
-    
-    # 处理特殊配置
-    if 'dataset_name' in config:
-        load_kwargs['name'] = config['dataset_name']
-    
-    if config['streaming']:
-        load_kwargs['streaming'] = True
-    
-    # 优先使用本地缓存，如果不存在才下载
-    load_kwargs['download_mode'] = 'reuse_cache_if_exists'
-    
-    dataset = load_dataset(**load_kwargs)
-    
-    # 如果设置了最大样本数且使用流式加载，则截取
-    if max_samples and config['streaming']:
-        dataset = dataset.take(max_samples)
-        print(f"Using {max_samples} samples from the dataset")
-    
-    # Tokenization 函数
-    def tokenize_function(examples):
-        text_field = config['text_field']
-        if isinstance(examples[text_field], list):
-            text = "".join(examples[text_field])
-        else:
-            text = examples[text_field]
-        return tokenizer(text, truncation=False)
-    
-    # 处理数据
-    print("Tokenizing dataset...")
-    tokenized_texts = []
-    
-    for example in tqdm(dataset, desc="Reading dataset", total=max_samples if max_samples else None):
-        text_field = config['text_field']
-        tokens = tokenize_function({text_field: example[text_field]})["input_ids"]
-        tokenized_texts.extend(tokens)
-    
-    # 分块处理
-    print(f"Creating blocks of size {block_size}...")
-    examples = []
-    for i in range(0, len(tokenized_texts) - block_size + 1, block_size):
-        examples.append(
-            torch.tensor(tokenized_texts[i:i + block_size], dtype=torch.long)
+
+    cache_base_dir = Path(cache_dir)
+    cache_path = cache_base_dir / f"dataset_{dataset_name}_blk{block_size}_samples{max_samples}"
+
+    if not force_reload and cache_path.exists():
+        print(f"Loading processed dataset from disk cache: {cache_path}")
+        try:
+            processed_dataset = HFDataset.load_from_disk(str(cache_path))
+            print(f"Dataset loaded from cache. Total blocks: {len(processed_dataset)}")
+        except Exception as e:
+            print(f"Failed to load from cache: {e}. Re-processing dataset.")
+            # 清理损坏的缓存并重新处理
+            import shutil
+            shutil.rmtree(cache_path, ignore_errors=True)
+            return get_dataloader(
+                tokenizer, dataset_name, batch_size, block_size, max_samples,
+                cache_dir, True, num_workers, pin_memory, prefetch_factor,
+                persistent_workers, num_proc
+            )
+    else:
+        print(f"Cache not found or `force_reload` is True. Processing dataset from scratch.")
+        cache_base_dir.mkdir(exist_ok=True)
+        
+        # --- 1. 加载原始数据集 ---
+        print(f"Loading raw dataset: {dataset_name}")
+        load_kwargs = {
+            'path': config['hf_path'],
+            'split': config['split'],
+            'name': config.get('dataset_name'),
+            'download_mode': 'reuse_cache_if_exists',
+        }
+        # 无论如何，先以流式加载来节省初始内存，特别是对于大文件
+        dataset = load_dataset(**load_kwargs, streaming=True)
+
+        if max_samples:
+            dataset = dataset.take(max_samples)
+            print(f"Streaming: taking the first {max_samples} samples.")
+        
+        # --- 2. 【关键修改】将流式数据集实体化 ---
+        # 这是创建缓存所必需的步骤。它会迭代数据流并将所有样本加载到内存中。
+        print("Materializing streaming dataset into a standard dataset...")
+        dataset_list = list(tqdm(dataset, desc="Loading samples into memory"))
+        dataset = HFDataset.from_list(dataset_list)
+        print(f"Materialized dataset with {len(dataset)} samples.")
+
+        # --- 3. Tokenization ---
+        if num_proc is None:
+            num_proc = os.cpu_count() or 1
+        
+        def tokenize_function(examples):
+            # 移除值为None的文本，避免tokenizer报错
+            texts = [text for text in examples[config['text_field']] if text is not None]
+            return tokenizer(texts, add_special_tokens=False)
+
+        print(f"Tokenizing dataset with {num_proc} processes...")
+        # 现在 'dataset' 是一个标准Dataset，可以安全地使用多进程map
+        tokenized_dataset = dataset.map(
+            tokenize_function,
+            batched=True,
+            num_proc=num_proc,
+            remove_columns=dataset.column_names,
+            desc="Running tokenizer on dataset",
         )
-    
-    print(f"Dataset prepared. Total blocks: {len(examples)}")
-    
-    # 保存到缓存
-    print(f"Saving dataset to cache: {cache_file}")
-    with open(cache_file, 'wb') as f:
-        pickle.dump(examples, f)
-    
-    return DataLoader(examples, batch_size=batch_size, shuffle=True)
+
+        # --- 4. 组合和分块 ---
+        def group_texts(examples):
+            concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            total_length = (total_length // block_size) * block_size
+            result = {
+                k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+                for k, t in concatenated_examples.items()
+            }
+            result["labels"] = result["input_ids"].copy()
+            return result
+
+        print(f"Grouping texts into chunks of {block_size}...")
+        processed_dataset = tokenized_dataset.map(
+            group_texts,
+            batched=True,
+            batch_size=1000,
+            num_proc=num_proc,
+            desc=f"Grouping texts into chunks of {block_size}",
+        )
+        
+        # --- 5. 保存到磁盘缓存 ---
+        # 现在 processed_dataset 是一个标准的Dataset，可以安全地保存
+        print(f"Saving processed dataset to disk cache: {cache_path}")
+        processed_dataset.save_to_disk(str(cache_path))
+        print(f"Dataset prepared and cached. Total blocks: {len(processed_dataset)}")
+
+    # --- 6. 创建 DataLoader ---
+    processed_dataset.set_format(type='torch', columns=['input_ids', 'labels'])
+
+    print(f"Creating DataLoader with batch_size={batch_size}, num_workers={num_workers}")
+    return DataLoader(
+        processed_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+    )
 
 
 def get_dataset_info(dataset_name='cosmopedia-100k'):
@@ -370,6 +379,74 @@ def list_available_datasets():
     print("=" * 100)
 
 
+def print_performance_tips():
+    """
+    打印DataLoader性能优化建议
+    """
+    import os
+    cpu_count = os.cpu_count()
+    
+    print("\n" + "=" * 80)
+    print("DataLoader 性能优化指南")
+    print("=" * 80)
+    
+    print("\n1. CPU相关参数:")
+    print(f"   - 当前系统CPU核心数: {cpu_count}")
+    print(f"   - 推荐 num_proc (tokenization进程数): {cpu_count} (使用所有核心)")
+    print(f"   - 推荐 num_workers (DataLoader进程数): 4-8")
+    print("   - 注意: num_workers过大会增加内存占用和进程通信开销")
+    
+    print("\n2. GPU相关参数:")
+    print("   - pin_memory=True: 使用固定内存，加速CPU->GPU传输")
+    print("   - 仅在GPU训练时启用，CPU训练时设为False")
+    
+    print("\n3. 预取参数:")
+    print("   - prefetch_factor=2-4: 每个worker预取的batch数")
+    print("   - 增大可减少等待时间，但会增加内存占用")
+    
+    print("\n4. Worker持久化:")
+    print("   - persistent_workers=True: 保持worker进程存活")
+    print("   - 避免每个epoch重新创建进程，但会占用更多内存")
+    
+    print("\n5. Tokenization优化:")
+    print("   - 使用batched=True进行批量tokenization")
+    print("   - batch_size=1000: 每批处理的样本数")
+    print("   - 多进程并行加速（num_proc参数）")
+    
+    print("\n6. 缓存策略:")
+    print("   - 首次加载会创建.pkl缓存文件")
+    print("   - 后续加载直接读取缓存，极大加速")
+    print("   - 使用force_reload=True强制重新处理")
+    
+    print("\n7. 关于GPU加速Tokenization:")
+    print("   - ❌ Tokenization不适合GPU加速")
+    print("   - ✓ GPU擅长: 大规模并行浮点运算（训练/推理）")
+    print("   - ✓ CPU擅长: 字符串处理、查找、分割（tokenization）")
+    print("   - ✓ 正确做法: 使用多进程CPU并行tokenization")
+    
+    print("\n8. 性能测试建议:")
+    print("   - 先用小数据集测试最佳参数组合")
+    print("   - 监控: CPU使用率、内存占用、GPU利用率")
+    print("   - 调整num_workers和num_proc找到平衡点")
+    
+    print("\n9. 推荐配置示例:")
+    print("   # 快速实验（小数据集）")
+    print("   dataloader = get_dataloader(tokenizer, 'cosmopedia-100k',")
+    print("                               batch_size=8, num_workers=4, num_proc=8)")
+    print()
+    print("   # 大规模训练（大数据集）")
+    print(f"   dataloader = get_dataloader(tokenizer, 'fineweb-edu',")
+    print(f"                               batch_size=32, num_workers=8, num_proc={cpu_count})")
+    print()
+    print("   # CPU训练")
+    print("   dataloader = get_dataloader(tokenizer, 'cosmopedia-100k',")
+    print("                               batch_size=4, num_workers=2, pin_memory=False)")
+    
+    print("\n" + "=" * 80)
+    print("提示: 使用 python cores/data.py --perf 查看此指南")
+    print("=" * 80 + "\n")
+
+
 # ============================================================================
 # 使用示例
 # ============================================================================
@@ -377,7 +454,7 @@ def list_available_datasets():
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Dataset configuration viewer")
+    parser = argparse.ArgumentParser(description="Dataset configuration viewer and performance guide")
     parser.add_argument(
         '--list', 
         action='store_true', 
@@ -388,6 +465,11 @@ if __name__ == "__main__":
         type=str,
         choices=list(DATASET_CONFIGS.keys()),
         help='Show detailed information about a specific dataset'
+    )
+    parser.add_argument(
+        '--perf',
+        action='store_true',
+        help='Show performance optimization tips for DataLoader'
     )
     
     args = parser.parse_args()
@@ -401,6 +483,8 @@ if __name__ == "__main__":
         for key, value in info.items():
             print(f"  {key}: {value}")
         print("=" * 80)
+    elif args.perf:
+        print_performance_tips()
     else:
         parser.print_help()
 

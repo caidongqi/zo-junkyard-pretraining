@@ -176,11 +176,11 @@ def plot_series(
         print("No loss data found in CSV files.")
         return
 
-    plt.figure(figsize=(14, 7))
+    plt.figure(figsize=(4, 2))
     
     for label, (steps, losses) in sorted(series.items()):
-        if label.startswith('FO') or label.startswith('ZO'):
-            steps = 4 * np.array(steps)
+        # if label.startswith('FO') or label.startswith('ZO'):
+            # steps = 4 * np.array(steps)
         plt.plot(steps, losses, label=label, linewidth=1.5, alpha=0.8)
 
     plt.xlabel("Training Step")
@@ -196,6 +196,7 @@ def plot_series(
         plot_title += f" (smoothed, window={smooth_window})"
     
     plt.title(plot_title)
+    plt.xlim(0,2000)
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9, framealpha=0.9)
     plt.grid(True, alpha=0.3, linestyle='--')
     plt.tight_layout()

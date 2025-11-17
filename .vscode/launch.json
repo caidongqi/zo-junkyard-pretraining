@@ -21,7 +21,8 @@
           "--learning_rate", "1e-3",
           "--optimizer", "mudamw",
           "--epochs", "5",
-          "--batch_size", "2"
+          "--batch_size", "2",
+          "--model_size", "200M"
         ],
         "env": {},
         "envFile": "${workspaceFolder}/.env"

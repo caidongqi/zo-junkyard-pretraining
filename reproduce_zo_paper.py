@@ -402,7 +402,7 @@ def train(
         max_samples=max_samples,
     )
     
-    # 为BP创建单独的dataloader（如果指定了不同的数据集）
+    # 为bp创建单独的dataloader（如果指定了不同的数据集）
     bp_dataloader = None
     if bp_dataset_name is not None and bp_dataset_name != dataset_name:
         print(f"Creating separate BP dataloader with dataset: {bp_dataset_name}")
@@ -416,6 +416,41 @@ def train(
         )
         if logger:
             logger.info("Separate BP dataloader created with dataset: %s", bp_dataset_name)
+
+    zo_like_modes = {'ZO', 'Calibrate', 'Instruct'}
+
+    query_batch_provider = None
+    if queries_use_different_data and mode in zo_like_modes:
+        query_dataloader = get_dataloader(
+            tokenizer=tokenizer,
+            dataset_name=dataset_name,
+            batch_size=batch_size,
+            block_size=block_size,
+            # max_samples=max_samples * q, # 修改为 bp samples的query倍
+            max_samples=max_samples
+        )
+        query_iter = iter(query_dataloader)
+
+        def _next_query_batch():
+            nonlocal query_iter
+            try:
+                batch = next(query_iter)
+            except StopIteration:
+                print("Query dataloader exhausted. Resetting and shuffling...") # 我加了这行打印方便你理解
+                query_iter = iter(query_dataloader)
+                batch = next(query_iter)
+            inputs = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
+            return inputs, labels
+
+        query_batch_provider = _next_query_batch
+        print("ZO queries will use fresh data batches per direction.")
+        if logger:
+            logger.info("ZO queries will use fresh data batches per direction.")
+
+    if mode in {'Calibrate', 'Instruct'}:
+        if bp_interval is None or bp_interval <= 0:
+            raise ValueError(f"Mode '{mode}' requires bp_interval > 0.")
 
     csv_path = Path(csv_file) if csv_file else None
     checkpoint_path = Path(checkpoint_dir) if checkpoint_dir else None
@@ -497,33 +532,6 @@ def train(
         p.requires_grad = False
     for p in trainable_params:
         p.requires_grad = True
-
-    zo_like_modes = {'ZO', 'Calibrate', 'Instruct'}
-
-    query_batch_provider = None
-    if queries_use_different_data and mode in zo_like_modes:
-        query_dataloader = DataLoader(dataloader.dataset, batch_size=batch_size, shuffle=True)
-        query_iter = iter(query_dataloader)
-
-        def _next_query_batch():
-            nonlocal query_iter
-            try:
-                batch = next(query_iter)
-            except StopIteration:
-                query_iter = iter(query_dataloader)
-                batch = next(query_iter)
-            batch = batch.to(device)
-            labels = batch.clone()
-            return batch, labels
-
-        query_batch_provider = _next_query_batch
-        print("ZO queries will use fresh data batches per direction.")
-        if logger:
-            logger.info("ZO queries will use fresh data batches per direction.")
-
-    if mode in {'Calibrate', 'Instruct'}:
-        if bp_interval is None or bp_interval <= 0:
-            raise ValueError(f"Mode '{mode}' requires bp_interval > 0.")
 
     # 初始化优化器和损失函数
     optimizer = None
@@ -630,6 +638,7 @@ def train(
     # 梯度累积计数器
     accumulation_counter = 0
     accumulated_loss = 0.0
+    grads_previous = []
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         if logger:
@@ -656,8 +665,8 @@ def train(
             else:
                 current_lr = lr # 如果不使用调度器，则保持固定学习率
 
-            inputs = batch.to(device)
-            labels = inputs.clone()
+            inputs = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
 
             grad_norm = 0.0  # 默认值
             
@@ -699,15 +708,18 @@ def train(
                         grads.append(torch.zeros_like(p.data))
                     else:
                         grads.append(p.grad.detach().clone())
-                # print(grads[0])
-                # print(grad_norm)
+                
+                # 计算BP梯度后清理显存
+                if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
+                    torch.cuda.empty_cache()
+                
                 avg_loss = accumulated_loss / accumulation_counter
                 loss = torch.tensor(avg_loss, device=device)
 
                 accumulation_counter = 0
                 accumulated_loss = 0.0
 
-                if mode == 'FO' or q is None or q <= 0:    
+                if mode == 'FO' or q is None or q <= 0 or not grads_previous:    
                     optimizer.step(grads=grads)
                     # print(grads)
 
@@ -717,17 +729,18 @@ def train(
                         for p in trainable_params:
                             if p.grad is not None:
                                 p.grad.zero_()
+                    grads_previous = [g.clone() for g in grads]
 
                     step += 1
             
                 elif mode in zo_like_modes:
                     # ZO模式：每个batch都是一次优化步骤
                 
-                    bp_grads = grads
+                    bp_grads = grads_previous
+
+                    grads_previous = [g.clone() for g in grads]
                         
-                    # 计算BP梯度后清理显存
-                    if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
-                        torch.cuda.empty_cache()
+
 
                     epsilon = 1e-4  # 增大扰动大小以提高数值稳定性
 
@@ -747,7 +760,7 @@ def train(
                         
                         manual_dirs = generate_instruct_directions_hybrid(
                             bp_grads=bp_grads,
-                            q=q,
+                            q=q * gradient_accumulation_steps,
                             cosine_target=current_cosine_target,
                             noise_scale=current_noise_scale,
                             device=device,
@@ -766,7 +779,7 @@ def train(
                         loss_fn,
                         inputs,
                         labels,
-                        q,
+                        q * gradient_accumulation_steps,
                         epsilon,
                         device,
                         manual_directions=manual_dirs,

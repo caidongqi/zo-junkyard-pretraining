@@ -234,6 +234,7 @@ def generate_instruct_directions_hybrid(
                     f"[Instruct-Hybrid] Summary: avg_cosine_similarity={average_cosine:.6f}, "
                     f"effective_rank={effective_rank}, "
                     f"total_time={elapsed:.4f}s",
+                    f"num of perturbations={int(q)}",
                     flush=True,
                 )
 
