@@ -17,10 +17,10 @@ The adjustment follows a progressive rule:
 # =====================================================================
 
 # Loss threshold: start adjusting parameters when loss drops below this value
-LOSS_THRESHOLD = 7.0
+LOSS_THRESHOLD = 8.0
 
 # Loss step: adjust parameters for every LOSS_STEP decrease in loss
-LOSS_STEP = 0.2
+LOSS_STEP = 0.1
 
 # Cosine target parameters
 TARGET_INITIAL = 0.01      # Initial cosine target value
@@ -29,7 +29,7 @@ TARGET_MAX = 0.99         # Maximum cosine target value
 
 # Noise scale parameters
 SCALE_INITIAL = 10.0      # Initial noise scale value
-SCALE_DECREMENT = 1.0     # Decrement per LOSS_STEP decrease
+SCALE_DECREMENT = 2.0     # Decrement per LOSS_STEP decrease
 SCALE_MIN = 0.1           # Minimum noise scale value
 
 

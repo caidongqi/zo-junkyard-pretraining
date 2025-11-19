@@ -24,6 +24,7 @@ from cores.generate_instruction import generate_instruct_directions_hybrid
 
 from cores.training_management import CheckpointManager, EvaluationManager
 from cores.instruct_params_manager import InstructParamsManager
+from cores.blend_ratio_manager import BlendRatioManager
 
 # --- 常量配置 (Constants) ---
 
@@ -129,7 +130,7 @@ def zo_gradient_estimator(
             batch_labels = batch_labels.to(device)
         return batch_inputs, batch_labels
 
-    # 计算原始参数位置的loss（用于记录）
+    # 计算原始参数位置的loss（用于记录）#WARNING: 这里会少一个batch的训练数据
     batch_inputs, batch_labels = get_batch()
     base_loss = compute_loss(batch_inputs, batch_labels)
 
@@ -426,8 +427,8 @@ def train(
             dataset_name=dataset_name,
             batch_size=batch_size,
             block_size=block_size,
-            # max_samples=max_samples * q, # 修改为 bp samples的query倍
-            max_samples=max_samples
+            max_samples=max_samples * q, # 修改为 bp samples的query倍
+            # max_samples=max_samples
         )
         query_iter = iter(query_dataloader)
 
@@ -447,6 +448,34 @@ def train(
         print("ZO queries will use fresh data batches per direction.")
         if logger:
             logger.info("ZO queries will use fresh data batches per direction.")
+
+    evaluate_batch_provider = None
+    evaluate_dataloader = get_dataloader(
+        tokenizer=tokenizer,
+        dataset_name=dataset_name,
+        batch_size=batch_size,
+        block_size=block_size,
+        # max_samples=max_samples * q, # 修改为 bp samples的query倍
+        max_samples=max_samples
+    )
+    eval_iter = iter(evaluate_dataloader)
+
+    def _next_evaluate_batch():
+        nonlocal eval_iter
+        try:
+            batch = next(eval_iter)
+        except StopIteration:
+            print("Evaluate dataloader exhausted. Resetting and shuffling...") # 我加了这行打印方便你理解
+            eval_iter = iter(evaluate_dataloader)
+            batch = next(eval_iter)
+        inputs = batch['input_ids'].to(device)
+        labels = batch['labels'].to(device)
+        return inputs, labels
+
+    evaluate_batch_provider = _next_evaluate_batch
+    print("Will use seperate dataloader to evaluate")
+    if logger:
+        logger.info("Will use seperate dataloader to evaluate")
 
     if mode in {'Calibrate', 'Instruct'}:
         if bp_interval is None or bp_interval <= 0:
@@ -570,8 +599,9 @@ def train(
     
     losses = []
     
-    # 初始化 Instruct 参数管理器（仅在 Instruct 模式下使用）
+    # 初始化 Instruct 参数与 Blend Ratio 管理器（仅在 Instruct 模式下使用）
     instruct_params_manager = None
+    blend_ratio_manager = None
     if mode == 'Instruct':
         # 使用从parallel_sweep.sh传入的初始值
         instruct_params_manager = InstructParamsManager(
@@ -591,6 +621,25 @@ def train(
         print("=" * 70 + "\n")
         if logger:
             logger.info("Instruct parameters manager initialized with dynamic adjustment")
+
+        blend_ratio_manager = BlendRatioManager(ratio_initial=blend_ratio)
+        print("\n" + "=" * 70)
+        print("🔀 Blend Ratio Manager Initialized")
+        print("=" * 70)
+        print(f"Initial blend_ratio: {blend_ratio_manager.ratio_initial:.4f}")
+        print(f"Will increase by {blend_ratio_manager.ratio_increment:.4f} "
+              f"per {blend_ratio_manager.loss_step:.3f} loss drop")
+        print(f"Maximum blend_ratio: {blend_ratio_manager.ratio_max:.4f}")
+        print(f"Loss threshold to start scheduling: {blend_ratio_manager.loss_threshold:.4f}")
+        print("=" * 70 + "\n")
+        if logger:
+            logger.info(
+                "Blend ratio manager initialized (dynamic). threshold=%.4f step=%.4f increment=%.4f max=%.4f",
+                blend_ratio_manager.loss_threshold,
+                blend_ratio_manager.loss_step,
+                blend_ratio_manager.ratio_increment,
+                blend_ratio_manager.ratio_max,
+            )
     
     # 初始化CSV日志
     if csv_path:
@@ -613,7 +662,8 @@ def train(
                 'loss',
                 'grad_norm',
                 'instruct_cosine_target',
-                'instruct_noise_scale'
+                'instruct_noise_scale',
+                'blend_ratio',
             ])
     
     # 开始训练
@@ -633,12 +683,14 @@ def train(
         'step': None,
         'current_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
         'current_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
+        'current_blend_ratio': blend_ratio if mode == 'Instruct' else None,
     }
     
     # 梯度累积计数器
     accumulation_counter = 0
     accumulated_loss = 0.0
     grads_previous = []
+    reference_current_loss = None
     for epoch in range(epochs):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
         if logger:
@@ -689,6 +741,7 @@ def train(
 
             loss_value = loss.item()
             (loss / gradient_accumulation_steps).backward()
+            loss_evaluate = None
 
             accumulation_counter += 1
             accumulated_loss += loss_value
@@ -715,11 +768,28 @@ def train(
                 
                 avg_loss = accumulated_loss / accumulation_counter
                 loss = torch.tensor(avg_loss, device=device)
+                reference_current_loss = float(loss.item())
 
                 accumulation_counter = 0
                 accumulated_loss = 0.0
 
                 if mode == 'FO' or q is None or q <= 0 or not grads_previous:    
+
+                    ### got loss on eval dataset
+                    epsilon = 1e-4  # 增大扰动大小以提高数值稳定性
+                    _, loss_evaluate = zo_gradient_estimator(
+                        model,
+                        trainable_params,
+                        loss_fn,
+                        inputs,
+                        labels,
+                        None,
+                        epsilon,
+                        device,
+                        data_provider=evaluate_batch_provider
+                    )
+                    ### end got loss on eval dataset
+
                     optimizer.step(grads=grads)
                     # print(grads)
 
@@ -786,17 +856,41 @@ def train(
                         data_provider=query_batch_provider
                     )
                     
+                                        ### got loss on eval dataset
+                    _, loss_evaluate = zo_gradient_estimator(
+                        model,
+                        trainable_params,
+                        loss_fn,
+                        inputs,
+                        labels,
+                        None,
+                        epsilon,
+                        device,
+                        data_provider=evaluate_batch_provider
+                    )
+                    ### end got loss on eval dataset
+
                     # ZO梯度估计后立即清理显存
                     if (isinstance(device, str) and device == 'cuda') or (hasattr(device, 'type') and device.type == 'cuda'):
                         torch.cuda.empty_cache()
 
                     # 在Instruct模式下，可选择混合BP和ZO梯度
                     # blend_ratio: 0=纯ZO, 1=纯BP, 0.5=均等混合
-                    if mode == 'Instruct' and blend_ratio > 0 and bp_grads is not None:
+                    applied_blend_ratio = blend_ratio
+                    if (
+                        blend_ratio_manager is not None
+                        and reference_current_loss is not None
+                    ):
+                        applied_blend_ratio = blend_ratio_manager.get_ratio(reference_current_loss)
+
+                    if mode == 'Instruct' and applied_blend_ratio > 0 and bp_grads is not None:
                         grad_paramwise = [
-                            (1 - blend_ratio) * gz + blend_ratio * gb
+                            (1 - applied_blend_ratio) * gz + applied_blend_ratio * gb
                             for gz, gb in zip(grad_paramwise, bp_grads)
                         ]
+                        last_metrics['current_blend_ratio'] = applied_blend_ratio
+                    elif mode == 'Instruct':
+                        last_metrics['current_blend_ratio'] = 0.0
                     
                     # print(grad_paramwise)
                     # 清理不再需要的临时变量（释放内存）
@@ -894,10 +988,11 @@ def train(
                             batch_size * (gradient_accumulation_steps if mode == 'FO' else 1),
                             optimizer_type,
                             row_bp_interval,
-                            loss.item(),
+                            loss_evaluate.item(),
                             grad_norm,
                             last_metrics.get('current_cosine_target', 'N/A') if mode == 'Instruct' else 'N/A',
-                            last_metrics.get('current_noise_scale', 'N/A') if mode == 'Instruct' else 'N/A'
+                            last_metrics.get('current_noise_scale', 'N/A') if mode == 'Instruct' else 'N/A',
+                            last_metrics.get('current_blend_ratio', 'N/A') if mode == 'Instruct' else 'N/A',
                         ])
 
                 if logger:
@@ -923,6 +1018,9 @@ def train(
                             last_metrics.get('current_cosine_target'),
                             last_metrics.get('current_noise_scale')
                         ])
+                    if mode == 'Instruct' and last_metrics.get('current_blend_ratio') is not None:
+                        log_msg += " blend_ratio=%.4f"
+                        log_args.append(last_metrics.get('current_blend_ratio'))
                     
                     logger.info(log_msg, *log_args)
 
@@ -953,6 +1051,7 @@ def train(
                         'dataset': dataset_name,
                         'instruct_cosine_target': last_metrics.get('current_cosine_target') if mode == 'Instruct' else None,
                         'instruct_noise_scale': last_metrics.get('current_noise_scale') if mode == 'Instruct' else None,
+                        'blend_ratio': last_metrics.get('current_blend_ratio') if mode == 'Instruct' else None,
                         'use_lr_scheduler': use_lr_scheduler,
                         'warmup_steps': warmup_steps if use_lr_scheduler else None,
                         'min_lr': min_lr if use_lr_scheduler else None,
@@ -997,6 +1096,8 @@ def train(
             
             postfix = {
                 "loss": f"{loss.item():.4f}",
+                # "zo_loss": f"{loss_zo.item():.4f}",
+                "eval_loss": f"{loss_evaluate.item():.4f}" if loss_evaluate else None,
                 "lr": f"{current_lr:.2e}", # 在进度条中显示当前学习率
                 "grad_norm": f"{grad_norm:.4f}",
                 "opt": optimizer_type,
@@ -1043,6 +1144,7 @@ def train(
             'dataset': dataset_name,
             'instruct_cosine_target': instruct_cosine_target if mode == 'Instruct' else None,
             'instruct_noise_scale': instruct_noise_scale if mode == 'Instruct' else None,
+            'blend_ratio': last_metrics.get('current_blend_ratio') if mode == 'Instruct' else None,
             'use_lr_scheduler': use_lr_scheduler,
             'warmup_steps': warmup_steps if use_lr_scheduler else None,
             'min_lr': min_lr if use_lr_scheduler else None,

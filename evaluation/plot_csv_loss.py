@@ -196,7 +196,8 @@ def plot_series(
         plot_title += f" (smoothed, window={smooth_window})"
     
     plt.title(plot_title)
-    plt.xlim(0,2000)
+    # plt.xlim(0,1000)
+    # plt.ylim(6,12)
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9, framealpha=0.9)
     plt.grid(True, alpha=0.3, linestyle='--')
     plt.tight_layout()

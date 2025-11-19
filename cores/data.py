@@ -283,7 +283,7 @@ def get_dataloader(
 
         # --- 3. Tokenization ---
         if num_proc is None:
-            num_proc = os.cpu_count() or 1
+            num_proc = 4
         
         def tokenize_function(examples):
             # 移除值为None的文本，避免tokenizer报错

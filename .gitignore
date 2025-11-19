@@ -1,4 +1,4 @@
 csv_logs*
 job_logs*
 cache/*
-logs/*
+logs*

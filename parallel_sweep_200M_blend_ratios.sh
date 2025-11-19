@@ -24,16 +24,16 @@ CLEANUP_DONE=false
 # 默认配置参数
 MODES=("FO" "Instruct") # 可选: FO, ZO, Calibrate, Instruct
 SCOPES=("full")
-BATCH_SIZES=(1) # 可以任意调大，只要符合内存就行
-GRADIENT_ACCUMULATION_STEPS=1  # 梯度累积步数，1表示不使用梯度累积
+BATCH_SIZES=(8) # 可以任意调大，只要符合内存就行
+GRADIENT_ACCUMULATION_STEPS=4  # 梯度累积步数，1表示不使用梯度累积
 BLOCK_SIZES=(512)  # 序列长度 (可选: 64, 128, 256, 512, 1024)
 QUERY_BUDGETS=(4 64)
 BP_INTERVALS=(1)
-BLEND_RATIOS=(0 0.9)  # Instruct模式梯度混合比例: 0.0=纯ZO, 1.0=纯BP, 0.5=均等混合
+BLEND_RATIOS=(0)  # Instruct模式梯度混合比例: 0.0=纯ZO, 1.0=纯BP, 0.5=均等混合
 INSTRUCT_COSINE_TARGETS=(0.01)
 INSTRUCT_NOISE_SCALES=(10.0)
 LEARNING_RATES_ZO=(1e-3)
-OPTIMIZERS=("adam")  # 可选: sgd, adam, mudamw
+OPTIMIZERS=("mudamw")  # 可选: sgd, adam, mudamw
 EPOCHS=1
 LOG_INTERVAL=10
 
@@ -85,7 +85,7 @@ BP_MAX_SAMPLES=""  # 留空使用推荐值，或指定具体数字
 
 # 并行配置
 MAX_PARALLEL_JOBS=32 # 最大并行任务数
-GPU_IDS="0,1,2,3,5"           # GPU ID列表，空表示自动检测
+GPU_IDS="3,4,5"           # GPU ID列表，空表示自动检测
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
